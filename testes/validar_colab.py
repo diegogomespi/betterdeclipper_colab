@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app
+from audio_diagnostics import candidate_metrics, diagnose_signal, representative_window
 from betterdeclipper import declip
 
 
@@ -61,6 +62,31 @@ def main() -> int:
             raise RuntimeError("A exportação MP3 320 kbps não foi criada.")
         if not Path(chart).is_file():
             raise RuntimeError("O gráfico de diagnóstico não foi criado.")
+
+        selected, selected_start = representative_window(clipped, sr, seconds=30)
+        if selected_start != 0 or len(selected) != len(clipped):
+            raise RuntimeError("A seleção representativa alterou indevidamente um arquivo curto.")
+        diagnostics = diagnose_signal(clipped, sr, ".wav", engine_info)
+        if diagnostics["clipped_fraction"] <= 0 or diagnostics["clipping_confidence"] != "alta":
+            raise RuntimeError("O diagnóstico integrado não reconheceu o clipping sintético severo.")
+        safety = candidate_metrics(clipped, restored_reference, sr, diagnostics["clipped_fraction"])
+        if not safety["accepted"]:
+            raise RuntimeError(f"Uma restauração conhecida como melhor foi rejeitada: {safety}")
+
+        app.OUTPUT_ROOT = tmp_path / "automatico"
+        automatic_steps = list(app.automatic_restore(str(source), {}, Progress()))
+        automatic_final = automatic_steps[-1]
+        automatic_update = automatic_final[1]
+        automatic_path = Path(str(automatic_update.get("value") if isinstance(automatic_update, dict) else automatic_update))
+        if not automatic_path.is_file():
+            raise RuntimeError("A restauração automática não criou o WAV final.")
+        automatic_info = sf.info(automatic_path)
+        if automatic_info.subtype != "PCM_24" or automatic_info.frames != len(clipped):
+            raise RuntimeError("A restauração automática não preservou formato ou duração.")
+        if "Comparação automática dos candidatos" not in str(automatic_final[4]):
+            raise RuntimeError("O controlador não registrou a comparação dos candidatos.")
+        if "SonicMaster não foi executado" not in str(automatic_final[4]):
+            raise RuntimeError("O relatório não registrou corretamente a situação do SonicMaster.")
 
     demo = app.create_app()
     if demo is None:

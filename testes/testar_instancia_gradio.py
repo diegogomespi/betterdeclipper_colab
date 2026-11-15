@@ -70,6 +70,14 @@ def main() -> int:
             raise RuntimeError("A taxa de amostragem original não foi preservada.")
         report["exportacoes"] = {"wav": wav.name, "flac": flac.name, "mp3": mp3.name, "grafico": process_chart.name}
 
+        automatic = client.predict(handle_file(clipped_path), api_name="/automatic_restore")
+        automatic_wav = path_from_output(automatic[2])
+        if sf.info(automatic_wav).subtype != "PCM_24" or sf.info(automatic_wav).frames != len(clipped):
+            raise RuntimeError("O modo automático não preservou WAV PCM 24 bits e duração.")
+        if "Decisão:" not in str(automatic[0]) or "Comparação automática dos candidatos" not in str(automatic[4]):
+            raise RuntimeError("O modo automático não apresentou diagnóstico e seleção dos candidatos.")
+        report["restauracao_automatica"] = automatic_wav.name
+
         loaded = client.predict(handle_file(clipped_path), handle_file(analysis_path), api_name="/load_saved_analysis")
         if "carregada" not in str(loaded[0]).lower():
             raise RuntimeError(f"A análise JSON não foi reutilizada: {loaded}")
