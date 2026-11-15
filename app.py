@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import gradio as gr
+import matplotlib
 import numpy as np
 import soundfile as sf
 import torch
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import pyloudnorm as pyln  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +38,9 @@ OUTPUT_ROOT = Path(os.getenv("BETTERDECLIPPER_OUTPUT_DIR", "/content/betterdecli
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 PROCESS_LOCK = threading.Lock()
 SUPPORTED_SUFFIXES = {".wav", ".flac", ".mp3"}
+PRESET_KEYS = {"Rápido (Fast)": "fast", "Normal": "normal", "Alta qualidade (High)": "high", "Melhor qualidade (Best)": "best"}
+MODE_KEYS = {"Automático (Auto)": "auto", "Clipping duro (Hard)": "hard", "Saturação suave (Soft)": "soft", "Limiter experimental": "limiter"}
+PRESET_FACTORS = {"fast": 1.0, "normal": 2.4, "high": 3.0, "best": 4.5}
 
 
 CSS = """
@@ -44,6 +52,7 @@ CSS = """
 .bd-hero p { margin:0; color:#aab7c6; }
 .bd-card { border:1px solid var(--bd-border) !important; border-radius:16px !important; background:var(--bd-panel) !important; }
 .bd-note { color:#9eacba; font-size:.92rem; }
+.compact-actions { gap:10px !important; }
 footer { display:none !important; }
 """
 
@@ -54,7 +63,39 @@ def _safe_name(value: str) -> str:
 
 
 def _blank_state() -> dict[str, Any]:
-    return {"source": None, "analysis": None, "analysis_path": None, "diagnosis": "", "job_dir": None}
+    return {
+        "source": None,
+        "analysis": None,
+        "analysis_path": None,
+        "analysis_scope": None,
+        "diagnosis": "",
+        "job_dir": None,
+        "duration_s": None,
+        "sample_rate": None,
+        "channels": None,
+        "benchmark_rtf": None,
+    }
+
+
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds):
+        return "calculando..."
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}min {secs:02d}s"
+    if minutes:
+        return f"{minutes}min {secs:02d}s"
+    return f"{secs}s"
+
+
+def _preset_key(label: str) -> str:
+    return PRESET_KEYS.get(label, str(label).lower())
+
+
+def _mode_key(label: str) -> str:
+    return MODE_KEYS.get(label, str(label).lower())
 
 
 def gpu_status() -> str:
@@ -121,9 +162,58 @@ def _read_audio(source: Path, temp_dir: Path) -> tuple[np.ndarray, int]:
         return sf.read(converted, always_2d=True, dtype="float64")
 
 
+def _dbfs(value: float | None) -> str:
+    if value is None or abs(value) < 1e-12:
+        return "indisponível"
+    return f"{20 * np.log10(abs(value)):+.2f} dBFS"
+
+
+def _analysis_lines_pt(info: dict[str, Any], channels: int) -> list[str]:
+    analysis = info.get("analysis") or {}
+    refs = analysis.get("refs") or []
+    knees = analysis.get("knees") or []
+    flagged = info.get("flagged")
+    if flagged is None:
+        flagged = []
+    channel_names = ["Esquerdo", "Direito"] if channels == 2 else [f"Canal {index + 1}" for index in range(channels)]
+    kind_labels = {
+        "clip": "clipping digital com platô",
+        "smeared": "clipping/saturação borrada por codec ou reamostragem",
+        "limiter": "teto de limitador",
+        "none": "nenhum teto confiável",
+    }
+    lines = ["Relatório técnico do diagnóstico oficial:"]
+    for channel in range(min(channels, len(refs))):
+        for polarity_index, polarity in enumerate(("positivo", "negativo")):
+            ref = refs[channel][polarity_index]
+            knee = knees[channel][polarity_index] if channel < len(knees) else None
+            fraction = float(flagged[channel][polarity_index]) * 100 if channel < len(flagged) else 0.0
+            kind = kind_labels.get(ref.get("kind"), str(ref.get("kind", "indefinido")))
+            ceiling = ref.get("theta")
+            peak = ref.get("peak")
+            blur = ""
+            if ref.get("kind") == "smeared" and ceiling:
+                blur = f"; dispersão {100 * float(ref.get('sigma', 0)) / abs(ceiling):.2f}%"
+            action = "sem região recuperável"
+            if knee is not None:
+                action = f"reconstrução acima de {_dbfs(knee)}"
+            lines.append(
+                f"- {channel_names[channel]}, polo {polarity}: {kind}; teto {_dbfs(ceiling)}; "
+                f"pico {_dbfs(peak)}{blur}; {action}; {fraction:.3f}% marcado."
+            )
+    kinds = analysis.get("kinds") or []
+    if kinds:
+        lines.append("Tipos reconhecidos: " + ", ".join(kind_labels.get(kind, kind) for kind in kinds) + ".")
+    if analysis.get("knee_found"):
+        lines.append("O motor encontrou indício real de ombro suave/saturação não linear abaixo do teto.")
+    else:
+        lines.append("O motor não confirmou ombro suave adicional no trecho analisado.")
+    return lines
+
+
 def _diagnosis(info: dict[str, Any], channels: int) -> tuple[str, str]:
     fraction = float(info.get("clipped_frac", 0.0)) * 100
-    official = "\n".join(analysis_lines(info, channels)) if info.get("analysis") else "Análise oficial indisponível."
+    official = "\n".join(_analysis_lines_pt(info, channels)) if info.get("analysis") else "Análise oficial indisponível."
     if fraction <= 0:
         headline = "Nenhum clipping, teto de limiter ou saturação recuperável foi identificado; o sinal será mantido."
     else:
@@ -143,24 +233,81 @@ def _new_job_dir(source: Path) -> Path:
 def _device_from_info(info: dict[str, Any]) -> str:
     used = str(info.get("device", "cpu"))
     if used.startswith("cuda") and torch.cuda.is_available():
-        return f"Processamento confirmado em **{used} — {torch.cuda.get_device_name(torch.cuda.current_device())}**."
+        index = torch.cuda.current_device()
+        free, total = torch.cuda.mem_get_info(index)
+        return (
+            f"Processamento confirmado em **{used} — {torch.cuda.get_device_name(index)}** · "
+            f"memória CUDA após a tarefa: **{free / 2**30:.1f} GB livres de {total / 2**30:.1f} GB**."
+        )
     return f"Processamento confirmado em **{used}**. CUDA disponível pelo PyTorch: **{torch.cuda.is_available()}**."
 
 
-def _run_analysis(source: Path, progress: gr.Progress) -> tuple[dict[str, Any], str, str, Path, str]:
+def _plot_waveforms(y: np.ndarray, x: np.ndarray, sr: int, output: Path, title: str) -> Path:
+    mono_y = np.mean(y, axis=1)
+    mono_x = np.mean(x, axis=1)
+    points = min(len(mono_y), 5000)
+    indices = np.linspace(0, len(mono_y) - 1, points, dtype=int)
+    seconds = indices / sr
+    original_view = mono_y[indices]
+    restored_view = mono_x[indices]
+    difference = restored_view - original_view
+    changed = np.abs(difference) > max(1e-7, float(np.max(np.abs(difference))) * 0.015)
+    spectrum_stride = max(1, sr // 24_000)
+    spectrum_sr = sr / spectrum_stride
+    spectrum_y = mono_y[::spectrum_stride]
+    spectrum_x = mono_x[::spectrum_stride]
+
+    plt.style.use("dark_background")
+    figure, axes = plt.subplots(2, 2, figsize=(13, 7.2))
+    figure.patch.set_facecolor("#0b0f14")
+    for axis in axes.flat:
+        axis.set_facecolor("#111822")
+        axis.grid(color="#2a3543", alpha=0.55, linewidth=0.6)
+        axis.tick_params(colors="#aab7c6")
+    axes[0, 0].plot(seconds, original_view, color="#8fa4bd", linewidth=0.7, label="Original")
+    axes[0, 0].plot(seconds, restored_view, color="#30d89b", linewidth=0.75, alpha=0.9, label="Recuperado")
+    axes[0, 0].scatter(seconds[changed], original_view[changed], color="#ff6b6b", s=3, alpha=0.55, label="Região alterada")
+    axes[0, 0].set_ylabel("Amplitude")
+    axes[0, 0].set_xlabel("Tempo (segundos)")
+    axes[0, 0].legend(loc="upper right", frameon=False, ncol=2, fontsize=8)
+    axes[0, 0].set_title(title, loc="left", fontsize=12, weight="bold")
+    axes[0, 1].fill_between(seconds, difference, 0, color="#f6b94a", alpha=0.85)
+    axes[0, 1].set_ylabel("Alteração real")
+    axes[0, 1].set_xlabel("Tempo (segundos)")
+    axes[0, 1].set_title("Amostras modificadas pelo motor", loc="left", fontsize=10)
+    axes[1, 0].specgram(spectrum_y, NFFT=1024, Fs=spectrum_sr, noverlap=768, cmap="magma")
+    axes[1, 0].set_title("Espectrograma original", loc="left", fontsize=10)
+    axes[1, 0].set_ylabel("Frequência (Hz)")
+    axes[1, 0].set_xlabel("Tempo (segundos)")
+    axes[1, 1].specgram(spectrum_x, NFFT=1024, Fs=spectrum_sr, noverlap=768, cmap="magma")
+    axes[1, 1].set_title("Espectrograma recuperado", loc="left", fontsize=10)
+    axes[1, 1].set_ylabel("Frequência (Hz)")
+    axes[1, 1].set_xlabel("Tempo (segundos)")
+    figure.tight_layout()
+    figure.savefig(output, dpi=140, bbox_inches="tight", facecolor=figure.get_facecolor())
+    plt.close(figure)
+    return output
+
+
+def _run_analysis(source: Path, progress: gr.Progress) -> tuple[dict[str, Any], str, str, Path, Path, dict[str, Any]]:
     job_dir = _new_job_dir(source)
     with tempfile.TemporaryDirectory(prefix="betterdeclipper_colab_") as tmp:
         y, sr = _read_audio(source, Path(tmp))
         if not len(y):
             raise RuntimeError("O arquivo não contém amostras de áudio.")
-
-        progress(0.02, desc="Executando diagnóstico oficial...")
+        duration_s = len(y) / sr
+        analysis_samples = min(len(y), int(60 * sr))
+        y_analysis = y[:analysis_samples]
+        analysis_duration_s = len(y_analysis) / sr
+        progress(0.02, desc=f"Analisando os primeiros {_format_seconds(analysis_duration_s)}...")
 
         def on_progress(step: int, total: int, elapsed: float) -> None:
-            progress((step, max(total, 1)), desc=f"Análise real · etapa {step}/{total} · {elapsed:.0f}s")
+            eta = (elapsed / step) * (total - step) if step > 0 and total > step else 0
+            progress((step, max(total, 1)), desc=f"Diagnóstico real · etapa {step}/{total} · restante ~{_format_seconds(eta)}")
 
-        _discard, info = declip(
-            y,
+        started = time.time()
+        restored_preview, info = declip(
+            y_analysis,
             sr,
             preset="fast",
             mode="auto",
@@ -169,28 +316,79 @@ def _run_analysis(source: Path, progress: gr.Progress) -> tuple[dict[str, Any], 
             progress=on_progress,
             full_analysis=True,
         )
-        headline, full_log = _diagnosis(info, y.shape[1])
+        elapsed = time.time() - started
+        headline, full_log = _diagnosis(info, y_analysis.shape[1])
         data = info["analysis"]["data"]
-        analysis_path = job_dir / f"{_safe_name(source.stem)}.analysis.json"
-        save_analysis(analysis_path, data, file=source.name, sr=sr, samples=len(y))
-        details = f"{len(y) / sr:.1f} s · {sr} Hz · {y.shape[1]} canal(is)\n{_device_from_info(info)}"
-        return data, headline, full_log, analysis_path, details
+        analysis_path = job_dir / f"{_safe_name(source.stem)}.preview.analysis.json"
+        save_analysis(analysis_path, data, file=source.name, sr=sr, samples=len(y_analysis))
+        chart_path = _plot_waveforms(
+            y_analysis,
+            restored_preview,
+            sr,
+            job_dir / "diagnostico_previa.png",
+            f"Diagnóstico oficial — primeiros {_format_seconds(analysis_duration_s)}",
+        )
+        metadata = {
+            "duration_s": duration_s,
+            "sample_rate": sr,
+            "channels": y.shape[1],
+            "analysis_duration_s": analysis_duration_s,
+            "analysis_elapsed_s": elapsed,
+            "benchmark_rtf": elapsed / max(analysis_duration_s, 0.001),
+            "device_line": _device_from_info(info),
+        }
+        return data, headline, full_log, analysis_path, chart_path, metadata
 
 
-def analyze_upload(audio: Any, state: dict[str, Any] | None, progress: gr.Progress = gr.Progress()) -> tuple[str, str, str | None, dict[str, Any], str]:
+def estimate_text(preset: str, duration: str, start_seconds: float, state: dict[str, Any] | None) -> str:
+    current = state or {}
+    total = current.get("duration_s")
+    rtf = current.get("benchmark_rtf")
+    if not total or not rtf:
+        return "### Tempo estimado\nA estimativa aparecerá depois do diagnóstico inicial."
+    factor = PRESET_FACTORS.get(_preset_key(preset), 2.4)
+    available = max(0.0, float(total) - max(0.0, float(start_seconds or 0)))
+    selected = available if duration == "Música completa" else min(available, float(duration.split()[0]))
+    selected_eta = selected * float(rtf) * factor
+    full_eta = float(total) * float(rtf) * factor
+    return (
+        "### Tempo estimado\n"
+        f"**Trecho escolhido:** {_format_seconds(selected_eta)} · **Música completa:** {_format_seconds(full_eta)}  \n"
+        "Estimativa baseada no teste real desta sessão; pode variar conforme o áudio, preset, GPU e memória disponível."
+    )
+
+
+def analyze_upload(audio: Any, preset: str, state: dict[str, Any] | None, progress: gr.Progress = gr.Progress()) -> tuple[Any, ...]:
     source = _source_path(audio)
     if not PROCESS_LOCK.acquire(blocking=False):
         raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
     try:
-        data, headline, log, analysis_path, details = _run_analysis(source, progress)
+        data, headline, log, analysis_path, chart_path, metadata = _run_analysis(source, progress)
         new_state = {
             "source": str(source),
             "analysis": data,
             "analysis_path": str(analysis_path),
+            "analysis_scope": "prévia",
             "diagnosis": headline,
             "job_dir": str(analysis_path.parent),
+            **metadata,
         }
-        return f"### Diagnóstico\n{headline}\n\n{details}", log, str(analysis_path), new_state, gpu_status()
+        details = (
+            f"**Duração total:** {_format_seconds(metadata['duration_s'])} · **Formato interno:** "
+            f"{metadata['sample_rate']} Hz, {metadata['channels']} canal(is)  \n"
+            f"**Diagnóstico:** primeiros {_format_seconds(metadata['analysis_duration_s'])}, concluído em "
+            f"{_format_seconds(metadata['analysis_elapsed_s'])}  \n{metadata['device_line']}"
+        )
+        estimate = estimate_text(preset, "15 segundos", 0, new_state)
+        return (
+            f"### Diagnóstico\n{headline}\n\n{details}",
+            log,
+            gr.update(value=str(analysis_path), visible=True),
+            new_state,
+            gpu_status(),
+            estimate,
+            gr.update(value=str(chart_path), visible=True),
+        )
     except Exception as exc:
         raise gr.Error(f"Falha no diagnóstico: {exc}") from exc
     finally:
@@ -204,7 +402,7 @@ def load_saved_analysis(audio: Any, analysis_file: Any, state: dict[str, Any] | 
         raise gr.Error("Selecione um arquivo .analysis.json.")
     data = load_analysis(path)
     current = dict(state or _blank_state())
-    current.update({"source": str(source), "analysis": data, "analysis_path": str(path)})
+    current.update({"source": str(source), "analysis": data, "analysis_path": str(path), "analysis_scope": "arquivo reutilizado"})
     message = "Análise oficial carregada. Confirme que ela pertence ao mesmo áudio ou à mesma cadeia de masterização."
     return f"### Diagnóstico\n{message}", f"Análise reutilizada: {path.name}", current
 
@@ -229,6 +427,57 @@ def _export_pcm24(x: np.ndarray, sr: int, output: Path) -> tuple[float, bool]:
     return peak, attenuated
 
 
+def _export_mp3(wav_path: Path, mp3_path: Path) -> Path | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    run = subprocess.run(
+        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(wav_path), "-codec:a", "libmp3lame", "-b:a", "320k", str(mp3_path)],
+        capture_output=True,
+        text=True,
+    )
+    return mp3_path if run.returncode == 0 and mp3_path.is_file() else None
+
+
+def _export_flac(wav_path: Path, flac_path: Path) -> Path:
+    audio, sr = sf.read(wav_path, always_2d=True, dtype="float64")
+    sf.write(flac_path, audio, sr, format="FLAC", subtype="PCM_24")
+    return flac_path
+
+
+def _loudness_matched_players(source: Path, start_seconds: float, outputs: list[str], destination: Path) -> list[str]:
+    with tempfile.TemporaryDirectory(prefix="betterdeclipper_ab_") as tmp:
+        original, sr = _read_audio(source, Path(tmp))
+    original, _label = _slice_audio(original, sr, start_seconds, "30 segundos")
+    signals = [original]
+    for path in outputs:
+        audio, output_sr = sf.read(path, always_2d=True, dtype="float64")
+        if output_sr != sr:
+            raise RuntimeError("A taxa de amostragem mudou durante a comparação A/B.")
+        signals.append(audio)
+    meter = pyln.Meter(sr)
+    loudness = [float(meter.integrated_loudness(signal)) for signal in signals]
+    finite = [value for value in loudness if np.isfinite(value)]
+    if not finite:
+        raise RuntimeError("Não foi possível medir o volume perceptivo do trecho.")
+    maximum_targets = []
+    for signal, value in zip(signals, loudness):
+        peak = float(np.max(np.abs(signal))) if signal.size else 0.0
+        if not np.isfinite(value) or peak <= 0:
+            maximum_targets.append(-24.0)
+        else:
+            maximum_targets.append(value + 20 * np.log10(0.98 / peak))
+    target_lufs = min(-14.0, *maximum_targets)
+    names = ["original", "automatico", "clipping_duro", "saturacao_suave"]
+    matched_paths: list[str] = []
+    for name, signal, value in zip(names, signals, loudness):
+        matched = signal if not np.isfinite(value) else pyln.normalize.loudness(signal, value, target_lufs)
+        path = destination / f"comparacao_30s_{name}_{target_lufs:.1f}LUFS.wav"
+        sf.write(path, matched, sr, subtype="PCM_24")
+        matched_paths.append(str(path))
+    return matched_paths
+
+
 def _process_one(
     source: Path,
     state: dict[str, Any],
@@ -237,21 +486,25 @@ def _process_one(
     start_seconds: float,
     duration: str,
     progress: gr.Progress,
-) -> tuple[str, str, dict[str, Any], str]:
+) -> tuple[str, str, str | None, str, dict[str, Any], str, str]:
     with tempfile.TemporaryDirectory(prefix="betterdeclipper_colab_") as tmp:
         y, sr = _read_audio(source, Path(tmp))
         y, selection_label = _slice_audio(y, sr, start_seconds, duration)
-        analysis = state.get("analysis")
+        preset_key = _preset_key(preset)
+        mode_key = _mode_key(mode)
+        needs_full_analysis = duration == "Música completa" and state.get("analysis_scope") != "completa"
+        analysis = None if needs_full_analysis else state.get("analysis")
 
         def on_progress(step: int, total: int, elapsed: float) -> None:
-            progress((step, max(total, 1)), desc=f"{mode} / {preset} · etapa {step}/{total} · {elapsed:.0f}s")
+            eta = (elapsed / step) * (total - step) if step > 0 and total > step else 0
+            progress((step, max(total, 1)), desc=f"{mode} / {preset} · etapa {step}/{total} · restante ~{_format_seconds(eta)}")
 
         started = time.time()
         x, info = declip(
             y,
             sr,
-            preset=preset.lower(),
-            mode=mode.lower(),
+            preset=preset_key,
+            mode=mode_key,
             device="auto",
             verbose=False,
             progress=on_progress,
@@ -259,26 +512,37 @@ def _process_one(
             full_analysis=analysis is None,
         )
         headline, official_log = _diagnosis(info, y.shape[1])
-        if state.get("analysis") is None and info.get("analysis"):
+        if info.get("analysis") and (analysis is None or state.get("analysis") is None):
             state["analysis"] = info["analysis"]["data"]
 
         job_dir = Path(state.get("job_dir") or _new_job_dir(source))
-        mode_dir = job_dir / f"{preset.lower()}-{mode.lower()}"
+        mode_dir = job_dir / f"{preset_key}-{mode_key}"
         mode_dir.mkdir(parents=True, exist_ok=True)
-        label = _safe_name(restoration_label(mode.lower(), info))
-        output = mode_dir / f"{_safe_name(source.stem)}_{label}_{preset.lower()}_{selection_label}_24bit.wav"
+        if info.get("analysis") and analysis is None:
+            analysis_path = job_dir / f"{_safe_name(source.stem)}.{selection_label}.analysis.json"
+            save_analysis(analysis_path, info["analysis"]["data"], file=source.name, sr=sr, samples=len(y))
+            state["analysis_path"] = str(analysis_path)
+            state["analysis_scope"] = "completa" if duration == "Música completa" else "prévia"
+        label = _safe_name(restoration_label(mode_key, info))
+        output = mode_dir / f"{_safe_name(source.stem)}_{label}_{preset_key}_{selection_label}_24bit.wav"
         raw_peak, attenuated = _export_pcm24(x, sr, output)
+        flac_path = _export_flac(output, output.with_suffix(".flac"))
+        mp3_output = mode_dir / f"{_safe_name(source.stem)}_{label}_{preset_key}_{selection_label}_320kbps.mp3"
+        mp3_path = _export_mp3(output, mp3_output)
+        chart_path = _plot_waveforms(y, x, sr, mode_dir / f"grafico_{selection_label}.png", f"Antes e depois — {mode} / {preset}")
         export_note = (
             f"Exportação PCM 24 bits recebeu apenas atenuação técnica para -0,1 dBFS porque o pico reconstruído era "
             f"{20 * np.log10(max(raw_peak, 1e-12)):+.2f} dBFS. Isso não é apresentado como restauração."
             if attenuated
             else "Exportação WAV PCM 24 bits sem normalização/equalização adicional."
         )
+        mp3_note = "MP3 320 kbps criado como cópia comprimida." if mp3_path else "MP3 não foi criado porque o FFmpeg não está disponível."
+        elapsed_total = time.time() - started
         log = (
-            f"Concluído em {time.time() - started:.1f}s.\n{_device_from_info(info)}\n{export_note}\n"
-            f"Saída: {output}\n\n{official_log}"
+            f"Concluído em {_format_seconds(elapsed_total)}.\n{_device_from_info(info)}\n{export_note}\n{mp3_note}\n"
+            f"WAV: {output}\nFLAC: {flac_path}\n" + (f"MP3: {mp3_path}\n" if mp3_path else "") + f"\n{official_log}"
         )
-        return str(output), log, state, headline
+        return str(output), str(flac_path), str(mp3_path) if mp3_path else None, log, state, headline, str(chart_path)
 
 
 def process_audio(
@@ -289,16 +553,38 @@ def process_audio(
     start_seconds: float,
     state: dict[str, Any] | None,
     progress: gr.Progress = gr.Progress(),
-) -> Iterator[tuple[Any, Any, str, str, dict[str, Any], str]]:
+) -> Iterator[tuple[Any, ...]]:
     source = _source_path(audio)
     current = dict(state or _blank_state())
     current["source"] = str(source)
     if not PROCESS_LOCK.acquire(blocking=False):
         raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
     try:
-        yield None, None, "Processamento iniciado...", "### Em andamento\nAguarde a reconstrução real da forma de onda.", current, gpu_status()
-        output, log, current, headline = _process_one(source, current, preset, mode, start_seconds, duration, progress)
-        yield output, output, log, f"### Resultado\n{headline}", current, gpu_status()
+        yield (
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Processamento iniciado. A barra superior mostra as etapas e o tempo restante estimado.",
+            "### Em andamento\nAguarde a reconstrução real da forma de onda.",
+            gr.update(),
+            current,
+            gpu_status(),
+        )
+        output, flac_output, mp3_output, log, current, headline, chart_path = _process_one(source, current, preset, mode, start_seconds, duration, progress)
+        yield (
+            gr.update(value=output, visible=True),
+            gr.update(value=output, visible=True),
+            gr.update(value=flac_output, visible=True),
+            gr.update(value=mp3_output, visible=bool(mp3_output)),
+            gr.update(value=chart_path, visible=True),
+            log,
+            f"### Resultado\n{headline}",
+            gr.update(value=current.get("analysis_path"), visible=bool(current.get("analysis_path"))),
+            current,
+            gpu_status(),
+        )
     except Exception as exc:
         raise gr.Error(f"Falha no processamento: {exc}") from exc
     finally:
@@ -308,41 +594,179 @@ def process_audio(
 def compare_modes(
     audio: Any,
     preset: str,
-    duration: str,
     start_seconds: float,
     state: dict[str, Any] | None,
     progress: gr.Progress = gr.Progress(),
-) -> Iterator[tuple[Any, Any, Any, str, dict[str, Any], str]]:
+) -> Iterator[tuple[Any, ...]]:
     source = _source_path(audio)
     current = dict(state or _blank_state())
     current["source"] = str(source)
     if not PROCESS_LOCK.acquire(blocking=False):
         raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
     try:
-        outputs: list[str | None] = [None, None, None]
-        logs = ["Comparação iniciada. A mesma análise e o mesmo trecho serão usados nos três modos."]
-        yield *outputs, "\n".join(logs), current, gpu_status()
-        for index, mode in enumerate(("auto", "hard", "soft")):
-            output, log, current, _headline = _process_one(source, current, preset, mode, start_seconds, duration, progress)
-            outputs[index] = output
-            logs.append(f"\n===== {mode.upper()} =====\n{log}")
-            yield *outputs, "\n".join(logs), current, gpu_status()
+        outputs: list[str] = []
+        logs = ["Comparação inteligente iniciada: 30 segundos, mesmos níveis detectados, modos Automático, Clipping duro e Saturação suave."]
+        yield None, None, None, None, "\n".join(logs), current, gpu_status()
+        modes = (("Automático (Auto)", "AUTOMÁTICO"), ("Clipping duro (Hard)", "CLIPPING DURO"), ("Saturação suave (Soft)", "SATURAÇÃO SUAVE"))
+        for mode, heading in modes:
+            output, _flac, _mp3, log, current, _headline, _chart = _process_one(
+                source, current, preset, mode, start_seconds, "30 segundos", progress
+            )
+            outputs.append(output)
+            logs.append(f"\n===== {heading} =====\n{log}")
+        destination = Path(current.get("job_dir") or _new_job_dir(source)) / "comparacao-inteligente"
+        destination.mkdir(parents=True, exist_ok=True)
+        original_ab, auto_ab, hard_ab, soft_ab = _loudness_matched_players(source, start_seconds, outputs, destination)
+        logs.append("\nPlayers A/B ajustados para o mesmo volume perceptivo (LUFS), sem alterar os arquivos de download.")
+        yield original_ab, auto_ab, hard_ab, soft_ab, "\n".join(logs), current, gpu_status()
     except Exception as exc:
         raise gr.Error(f"Falha na comparação: {exc}") from exc
     finally:
         PROCESS_LOCK.release()
 
 
-def clear_session() -> tuple[None, str, str, None, None, dict[str, Any], str]:
-    return None, "### Diagnóstico\nEnvie um áudio para iniciar a análise oficial.", "Pronto.", None, None, _blank_state(), gpu_status()
+def add_segment(
+    start_seconds: float,
+    duration: str,
+    preset: str,
+    mode: str,
+    rows: Any,
+    state: dict[str, Any] | None,
+) -> tuple[list[list[Any]], str]:
+    total = float((state or {}).get("duration_s") or 0)
+    if total <= 0:
+        raise gr.Error("Envie e analise um áudio antes de adicionar trechos.")
+    start = max(0.0, float(start_seconds or 0))
+    end = total if duration == "Música completa" else min(total, start + float(duration.split()[0]))
+    if start >= total or end <= start:
+        raise gr.Error("O trecho escolhido está fora da duração do áudio.")
+    current_rows = rows.tolist() if hasattr(rows, "tolist") else list(rows or [])
+    current_rows.append([round(start, 3), round(end, 3), preset, mode])
+    return current_rows, f"Trecho adicionado: {_format_seconds(start)} até {_format_seconds(end)} · {preset} · {mode}."
+
+
+def process_segment_plan(
+    audio: Any,
+    rows: Any,
+    state: dict[str, Any] | None,
+    progress: gr.Progress = gr.Progress(),
+) -> Iterator[tuple[Any, ...]]:
+    source = _source_path(audio)
+    plan = rows.tolist() if hasattr(rows, "tolist") else list(rows or [])
+    plan = [row for row in plan if row and len(row) >= 4 and row[0] is not None and row[1] is not None]
+    if not plan:
+        raise gr.Error("Adicione pelo menos um trecho ao plano.")
+    parsed = sorted([(float(row[0]), float(row[1]), str(row[2]), str(row[3])) for row in plan], key=lambda item: item[0])
+    for index, (start, end, _preset, _mode) in enumerate(parsed):
+        if end <= start:
+            raise gr.Error(f"Trecho {index + 1}: o fim precisa ser maior que o início.")
+        if index and start < parsed[index - 1][1]:
+            raise gr.Error("Há trechos sobrepostos. Ajuste o plano para que cada intervalo seja independente.")
+    if not PROCESS_LOCK.acquire(blocking=False):
+        raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
+    current = dict(state or _blank_state())
+    try:
+        yield (
+            gr.update(value=None, visible=False), gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False), gr.update(value=None, visible=False),
+            gr.update(value=None, visible=False),
+            "Plano de trechos iniciado. Cada intervalo será analisado e recuperado separadamente.",
+            "### Em andamento\nProcessando o plano de trechos com transições suaves.",
+            gr.update(), current, gpu_status(),
+        )
+        with tempfile.TemporaryDirectory(prefix="betterdeclipper_trechos_") as tmp:
+            original, sr = _read_audio(source, Path(tmp))
+        mixed = original.copy()
+        context = int(1.5 * sr)
+        fade = max(2, int(0.05 * sr))
+        logs = []
+        last_info: dict[str, Any] = {}
+        started_all = time.time()
+        for segment_index, (start_s, end_s, preset_label, mode_label) in enumerate(parsed):
+            start = max(0, int(start_s * sr))
+            end = min(len(original), int(end_s * sr))
+            context_start = max(0, start - context)
+            context_end = min(len(original), end + context)
+            segment = original[context_start:context_end]
+
+            def on_progress(step: int, total: int, elapsed: float, number: int = segment_index) -> None:
+                part = step / max(total, 1)
+                progress(((number + part), len(parsed)), desc=f"Trecho {number + 1}/{len(parsed)} · etapa {step}/{total} · {_format_seconds(elapsed)}")
+
+            restored, info = declip(
+                segment,
+                sr,
+                preset=_preset_key(preset_label),
+                mode=_mode_key(mode_label),
+                device="auto",
+                verbose=False,
+                progress=on_progress,
+                full_analysis=True,
+            )
+            last_info = info
+            inner_start = start - context_start
+            inner_end = inner_start + (end - start)
+            restored_inner = restored[inner_start:inner_end]
+            weights = np.ones(len(restored_inner), dtype=np.float64)
+            fade_len = min(fade, len(weights) // 2)
+            if fade_len and start > 0:
+                weights[:fade_len] = np.linspace(0, 1, fade_len, endpoint=False)
+            if fade_len and end < len(original):
+                weights[-fade_len:] = np.minimum(weights[-fade_len:], np.linspace(1, 0, fade_len, endpoint=False))
+            mixed[start:end] = mixed[start:end] * (1 - weights[:, None]) + restored_inner * weights[:, None]
+            headline, _detail = _diagnosis(info, original.shape[1])
+            logs.append(f"Trecho {segment_index + 1} ({start_s:.2f}s–{end_s:.2f}s, {preset_label}, {mode_label}): {headline}")
+
+        job_dir = Path(current.get("job_dir") or _new_job_dir(source)) / "plano-de-trechos"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = job_dir / f"{_safe_name(source.stem)}_trechos_24bit.wav"
+        _peak, attenuated = _export_pcm24(mixed, sr, wav_path)
+        flac_path = _export_flac(wav_path, wav_path.with_suffix(".flac"))
+        mp3_path = _export_mp3(wav_path, wav_path.with_name(f"{wav_path.stem}_320kbps.mp3"))
+        chart_path = _plot_waveforms(original, mixed, sr, job_dir / "grafico_plano_de_trechos.png", "Plano de trechos — antes e depois")
+        safety = "Foi aplicada atenuação final de segurança para evitar clipping na exportação." if attenuated else "A exportação não precisou de atenuação final."
+        log = (
+            "\n".join(logs)
+            + f"\n\nPlano concluído em {_format_seconds(time.time() - started_all)}. {safety}\n"
+            + (_device_from_info(last_info) if last_info else "")
+        )
+        yield (
+            gr.update(value=str(wav_path), visible=True), gr.update(value=str(wav_path), visible=True),
+            gr.update(value=str(flac_path), visible=True), gr.update(value=str(mp3_path), visible=bool(mp3_path)),
+            gr.update(value=str(chart_path), visible=True), log,
+            f"### Resultado\n{len(parsed)} trecho(s) recuperado(s) e unido(s) com transições de 50 ms.",
+            gr.update(), current, gpu_status(),
+        )
+    except Exception as exc:
+        raise gr.Error(f"Falha no plano de trechos: {type(exc).__name__}: {exc}") from exc
+    finally:
+        PROCESS_LOCK.release()
+
+
+def clear_session() -> tuple[Any, ...]:
+    return (
+        None,
+        "### Diagnóstico\nEnvie um áudio para iniciar a análise oficial.",
+        "Pronto.",
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        "### Tempo estimado\nA estimativa aparecerá depois do diagnóstico inicial.",
+        [],
+        _blank_state(),
+        gpu_status(),
+    )
 
 
 def create_app() -> gr.Blocks:
     with gr.Blocks(css=CSS, theme=gr.themes.Base(primary_hue="emerald", neutral_hue="slate"), title="BetterDeclipper Colab") as demo:
         state = gr.State(_blank_state())
         gr.HTML(
-            "<section class='bd-hero'><h1>BetterDeclipper Colab</h1>"
-            "<p>Recuperação real de clipping com a API oficial, PyTorch e CUDA quando confirmada.</p></section>"
+            "<section class='bd-hero'><h1>BetterDeclipper AI Studio</h1>"
+            "<p>Diagnóstico e recuperação real de gravações distorcidas, com a API oficial BetterDeclipper.</p></section>"
         )
         device = gr.Markdown(gpu_status(), elem_classes="bd-card")
 
@@ -350,36 +774,59 @@ def create_app() -> gr.Blocks:
             with gr.Column(scale=6, elem_classes="bd-card"):
                 audio = gr.Audio(label="Áudio original — WAV, FLAC ou MP3", type="filepath", sources=["upload"])
                 diagnosis = gr.Markdown("### Diagnóstico\nEnvie um áudio para iniciar a análise oficial.")
-                with gr.Row():
-                    analysis_download = gr.File(label="Baixar análise do clipping", interactive=False)
-                    analysis_upload = gr.File(label="Reutilizar análise .json", file_types=[".json"], type="filepath")
-                use_analysis = gr.Button("Carregar análise selecionada")
+                with gr.Row(elem_classes="compact-actions"):
+                    analysis_download = gr.DownloadButton("Baixar análise do clipping", visible=False)
+                    analysis_upload = gr.UploadButton("Selecionar análise .json", file_types=[".json"], file_count="single", type="filepath")
+                use_analysis = gr.Button("Usar análise selecionada")
             with gr.Column(scale=4, elem_classes="bd-card"):
-                preset = gr.Radio(["Fast", "Normal", "High", "Best"], value="Normal", label="Preset")
-                mode = gr.Radio(["Auto", "Hard", "Soft", "Limiter"], value="Auto", label="Modo")
-                duration = gr.Radio(["15 segundos", "30 segundos", "60 segundos", "Música completa"], value="15 segundos", label="Trecho")
+                preset = gr.Radio(list(PRESET_KEYS), value="Normal", label="Qualidade (preset oficial)")
+                mode = gr.Radio(list(MODE_KEYS), value="Automático (Auto)", label="Tipo de recuperação")
+                duration = gr.Radio(["15 segundos", "30 segundos", "60 segundos", "Música completa"], value="15 segundos", label="Duração a processar")
                 start_seconds = gr.Number(value=0, minimum=0, label="Início do trecho (segundos)")
-                gr.Markdown("<span class='bd-note'>Limiter é experimental. WAV 24 bits recebe somente atenuação de segurança se os picos ultrapassarem 0 dBFS.</span>")
+                estimate = gr.Markdown("### Tempo estimado\nA estimativa aparecerá depois do diagnóstico inicial.")
+                gr.Markdown("<span class='bd-note'>O modo Limiter é experimental. A exportação recebe somente atenuação de segurança quando necessária para não criar novo clipping.</span>")
                 run_button = gr.Button("Recuperar áudio", variant="primary")
-                compare_button = gr.Button("Comparar Auto × Hard × Soft")
+                compare_button = gr.Button("Comparação inteligente — 30 segundos")
                 clear_button = gr.Button("Limpar sessão")
 
-        with gr.Row():
-            recovered = gr.Audio(label="Áudio recuperado", type="filepath")
-            download = gr.File(label="Download WAV 24 bits", interactive=False)
-        result_summary = gr.Markdown("### Resultado\nAguardando processamento.")
-        logs = gr.Textbox(label="Logs e diagnóstico detalhado", value="Pronto.", lines=14, max_lines=28, interactive=False)
-
-        with gr.Accordion("Comparação dos modos (mesmo áudio, análise e trecho)", open=False):
+        with gr.Accordion("Plano avançado — configurações diferentes por trecho", open=False):
+            gr.Markdown("Adicione intervalos sem sobreposição. Cada trecho será analisado separadamente e unido ao original com transições de 50 ms.")
+            segment_plan = gr.Dataframe(
+                headers=["Início (s)", "Fim (s)", "Qualidade", "Recuperação"],
+                datatype=["number", "number", "str", "str"],
+                row_count=0,
+                col_count=(4, "fixed"),
+                type="array",
+                interactive=True,
+                label="Trechos configurados",
+            )
             with gr.Row():
-                compare_auto = gr.Audio(label="Auto", type="filepath")
-                compare_hard = gr.Audio(label="Hard", type="filepath")
-                compare_soft = gr.Audio(label="Soft", type="filepath")
+                add_segment_button = gr.Button("Adicionar configuração atual ao plano")
+                process_plan_button = gr.Button("Processar plano de trechos", variant="primary")
+            segment_status = gr.Markdown("Nenhum trecho adicionado.")
+
+        with gr.Row():
+            recovered = gr.Audio(label="Áudio recuperado", type="filepath", visible=False)
+            with gr.Column():
+                download = gr.DownloadButton("Baixar WAV PCM 24 bits", visible=False, variant="primary")
+                download_flac = gr.DownloadButton("Baixar FLAC 24 bits", visible=False)
+                download_mp3 = gr.DownloadButton("Baixar MP3 320 kbps", visible=False)
+        result_summary = gr.Markdown("### Resultado\nAguardando processamento.")
+        visualization = gr.Image(label="Formas de onda, espectrogramas e regiões alteradas", visible=False, interactive=False)
+        logs = gr.Textbox(label="Logs e diagnóstico detalhado", value="Pronto.", lines=9, max_lines=20, interactive=False)
+
+        with gr.Accordion("Players A/B — volumes perceptivos equivalentes", open=False):
+            with gr.Row():
+                compare_original = gr.Audio(label="Original (A)", type="filepath")
+                compare_auto = gr.Audio(label="Automático", type="filepath")
+            with gr.Row():
+                compare_hard = gr.Audio(label="Clipping duro", type="filepath")
+                compare_soft = gr.Audio(label="Saturação suave", type="filepath")
 
         audio.upload(
             analyze_upload,
-            inputs=[audio, state],
-            outputs=[diagnosis, logs, analysis_download, state, device],
+            inputs=[audio, preset, state],
+            outputs=[diagnosis, logs, analysis_download, state, device, estimate, visualization],
             concurrency_limit=1,
         )
         use_analysis.click(
@@ -391,18 +838,31 @@ def create_app() -> gr.Blocks:
         run_button.click(
             process_audio,
             inputs=[audio, preset, mode, duration, start_seconds, state],
-            outputs=[recovered, download, logs, result_summary, state, device],
+            outputs=[recovered, download, download_flac, download_mp3, visualization, logs, result_summary, analysis_download, state, device],
             concurrency_limit=1,
         )
         compare_button.click(
             compare_modes,
-            inputs=[audio, preset, duration, start_seconds, state],
-            outputs=[compare_auto, compare_hard, compare_soft, logs, state, device],
+            inputs=[audio, preset, start_seconds, state],
+            outputs=[compare_original, compare_auto, compare_hard, compare_soft, logs, state, device],
             concurrency_limit=1,
         )
+        add_segment_button.click(
+            add_segment,
+            inputs=[start_seconds, duration, preset, mode, segment_plan, state],
+            outputs=[segment_plan, segment_status],
+        )
+        process_plan_button.click(
+            process_segment_plan,
+            inputs=[audio, segment_plan, state],
+            outputs=[recovered, download, download_flac, download_mp3, visualization, logs, result_summary, analysis_download, state, device],
+            concurrency_limit=1,
+        )
+        for control in (preset, duration, start_seconds):
+            control.change(estimate_text, inputs=[preset, duration, start_seconds, state], outputs=estimate)
         clear_button.click(
             clear_session,
-            outputs=[audio, diagnosis, logs, recovered, download, state, device],
+            outputs=[audio, diagnosis, logs, recovered, download, download_flac, download_mp3, visualization, analysis_download, estimate, segment_plan, state, device],
             concurrency_limit=1,
         )
     return demo

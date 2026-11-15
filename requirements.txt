@@ -1,5 +1,7 @@
 gradio==5.49.1
+matplotlib>=3.8,<4
 numpy>=1.26,<3
+pyloudnorm>=0.1.1,<1
 scipy>=1.11,<2
 soundfile>=0.12,<1
 git+https://github.com/Qupci/BetterDeclipper.git@f9ff7f4f9a8840f5734bd6b5fbef4ebedd53cff8

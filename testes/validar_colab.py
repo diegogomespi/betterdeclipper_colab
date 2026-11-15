@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app
+from betterdeclipper import declip
 
 
 def main() -> int:
@@ -30,7 +31,17 @@ def main() -> int:
             def __call__(self, *_args, **_kwargs):
                 return None
 
-        output, log, _state, headline = app._process_one(source, state, "Fast", "Hard", 0, "Música completa", Progress())
+        restored_reference, engine_info = declip(clipped, sr, preset="fast", mode="hard", device="auto", verbose=False)
+        mse_clipped = float(np.mean((clean[:, None] - clipped) ** 2))
+        mse_restored = float(np.mean((clean[:, None] - restored_reference) ** 2))
+        if not mse_restored < mse_clipped:
+            raise RuntimeError(f"A restauração não melhorou o erro conhecido: {mse_clipped} -> {mse_restored}")
+        if engine_info.get("clipped_frac", 0) <= 0:
+            raise RuntimeError("O motor não marcou o clipping sintético conhecido.")
+
+        output, flac, mp3, log, _state, headline, chart = app._process_one(
+            source, state, "Rápido (Fast)", "Clipping duro (Hard)", 0, "Música completa", Progress()
+        )
         info = sf.info(output)
         if info.subtype != "PCM_24":
             raise RuntimeError(f"Formato inesperado: {info.subtype}")
@@ -40,6 +51,12 @@ def main() -> int:
             raise RuntimeError("O dispositivo realmente usado não foi registrado.")
         if "Detectado" not in headline:
             raise RuntimeError("O clipping sintético não foi detectado.")
+        if sf.info(flac).subtype != "PCM_24":
+            raise RuntimeError("A exportação FLAC não preservou PCM 24 bits.")
+        if not Path(mp3).is_file():
+            raise RuntimeError("A exportação MP3 320 kbps não foi criada.")
+        if not Path(chart).is_file():
+            raise RuntimeError("O gráfico de diagnóstico não foi criado.")
 
     demo = app.create_app()
     if demo is None:
