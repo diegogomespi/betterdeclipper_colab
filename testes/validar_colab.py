@@ -15,6 +15,10 @@ import app
 from betterdeclipper import declip
 
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
     sr = 16_000
     t = np.arange(int(sr * 0.75), dtype=np.float64) / sr
@@ -62,7 +66,7 @@ def main() -> int:
     if demo is None:
         raise RuntimeError("A interface Gradio não foi criada.")
     print("VALIDAÇÃO COLAB CONCLUÍDA")
-    print(ascii(app.gpu_status()))
+    print(app.gpu_status())
     return 0
 
 

@@ -35,6 +35,8 @@ O link Gradio compartilhado é temporário e existe somente enquanto a célula e
 - Reutilização da análise oficial sem reenviar o áudio.
 - Comparação inteligente de 30 segundos em Auto × Hard × Soft.
 - Players A/B nivelados por loudness (LUFS) somente para audição comparativa; os arquivos exportados não recebem esse ajuste.
+- Verificação numérica da saída (correlação, diferença RMS e amostras alteradas), sempre descrita como medida de mudança — não como prova de melhora sonora.
+- Aviso quando Automático e Clipping duro produzem exatamente o mesmo resultado no trecho analisado.
 - Formas de onda, espectrogramas e indicação das amostras realmente alteradas.
 - Progresso real por etapas, tempo restante aproximado e logs detalhados.
 - Exportação WAV PCM 24 bits, FLAC 24 bits e MP3 320 kbps, mantendo a taxa de amostragem original.

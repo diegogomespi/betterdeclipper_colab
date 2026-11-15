@@ -178,7 +178,7 @@ def _analysis_lines_pt(info: dict[str, Any], channels: int) -> list[str]:
     channel_names = ["Esquerdo", "Direito"] if channels == 2 else [f"Canal {index + 1}" for index in range(channels)]
     kind_labels = {
         "clip": "clipping digital com platô",
-        "smeared": "clipping/saturação borrada por codec ou reamostragem",
+        "smeared": "teto de clipping borrado/irregular (possível codec, reamostragem ou cadeia analógica)",
         "limiter": "teto de limitador",
         "none": "nenhum teto confiável",
     }
@@ -217,9 +217,13 @@ def _diagnosis(info: dict[str, Any], channels: int) -> tuple[str, str]:
     if fraction <= 0:
         headline = "Nenhum clipping, teto de limiter ou saturação recuperável foi identificado; o sinal será mantido."
     else:
-        kinds = (info.get("analysis") or {}).get("kinds") or []
+        analysis = info.get("analysis") or {}
+        kinds = [kind for kind in (analysis.get("kinds") or []) if kind != "none"]
         labels = {"clip": "clipping duro", "smeared": "clipping borrado", "limiter": "limitador brickwall"}
-        found = ", ".join(labels.get(kind, kind) for kind in kinds) or str(info.get("mode", "detectado"))
+        found_parts = [labels.get(kind, kind) for kind in kinds]
+        if analysis.get("knee_found"):
+            found_parts.append("saturação não linear/ombro suave")
+        found = ", ".join(found_parts) or "região não linear marcada pelo motor"
         headline = f"Detectado: {found}. {fraction:.3f}% das amostras foram marcadas para reconstrução."
     return headline, f"{headline}\n\n{official}"
 
@@ -478,6 +482,48 @@ def _loudness_matched_players(source: Path, start_seconds: float, outputs: list[
     return matched_paths
 
 
+def _change_measurement(reference: np.ndarray, candidate: np.ndarray) -> tuple[str, dict[str, float | bool]]:
+    """Mede alteração numérica sem confundi-la com melhora de qualidade."""
+    if reference.shape != candidate.shape:
+        raise RuntimeError("A saída não manteve o mesmo tamanho e número de canais do trecho de entrada.")
+    ref = np.asarray(reference, dtype=np.float64).reshape(-1)
+    out = np.asarray(candidate, dtype=np.float64).reshape(-1)
+    difference = out - ref
+    rms_ref = float(np.sqrt(np.mean(ref * ref))) if ref.size else 0.0
+    rms_difference = float(np.sqrt(np.mean(difference * difference))) if difference.size else 0.0
+    peak_difference = float(np.max(np.abs(difference))) if difference.size else 0.0
+    changed_fraction = float(np.mean(np.abs(difference) > 1e-4)) if difference.size else 0.0
+    identical = bool(np.array_equal(ref, out))
+    relative_db = (
+        float(20 * np.log10(rms_difference / rms_ref))
+        if rms_ref > 1e-15 and rms_difference > 1e-15
+        else float("-inf")
+    )
+    correlation = (
+        float(np.corrcoef(ref, out)[0, 1])
+        if ref.size > 1 and np.std(ref) > 1e-15 and np.std(out) > 1e-15
+        else 1.0 if identical else 0.0
+    )
+    if identical:
+        text = "Verificação da execução: a saída ficou numericamente idêntica ao trecho de entrada."
+    else:
+        relative_text = f"{relative_db:+.2f} dB" if np.isfinite(relative_db) else "abaixo do limite numérico"
+        text = (
+            "Verificação da execução: a saída não é uma cópia do original. "
+            f"Diferença RMS relativa {relative_text}; correlação {correlation:.6f}; "
+            f"{changed_fraction * 100:.3f}% das amostras mudaram mais de -80 dBFS; "
+            f"maior diferença {peak_difference:.6f}."
+        )
+    text += " Esses valores medem alteração, não comprovam melhora sonora."
+    return text, {
+        "identical": identical,
+        "relative_db": relative_db,
+        "correlation": correlation,
+        "changed_fraction": changed_fraction,
+        "peak_difference": peak_difference,
+    }
+
+
 def _process_one(
     source: Path,
     state: dict[str, Any],
@@ -511,6 +557,8 @@ def _process_one(
             analysis=analysis,
             full_analysis=analysis is None,
         )
+        change_note, change_metrics = _change_measurement(y, x)
+        info["change_metrics"] = change_metrics
         headline, official_log = _diagnosis(info, y.shape[1])
         if info.get("analysis") and (analysis is None or state.get("analysis") is None):
             state["analysis"] = info["analysis"]["data"]
@@ -539,10 +587,11 @@ def _process_one(
         mp3_note = "MP3 320 kbps criado como cópia comprimida." if mp3_path else "MP3 não foi criado porque o FFmpeg não está disponível."
         elapsed_total = time.time() - started
         log = (
-            f"Concluído em {_format_seconds(elapsed_total)}.\n{_device_from_info(info)}\n{export_note}\n{mp3_note}\n"
+            f"Concluído em {_format_seconds(elapsed_total)}.\n{_device_from_info(info)}\n{change_note}\n{export_note}\n{mp3_note}\n"
             f"WAV: {output}\nFLAC: {flac_path}\n" + (f"MP3: {mp3_path}\n" if mp3_path else "") + f"\n{official_log}"
         )
-        return str(output), str(flac_path), str(mp3_path) if mp3_path else None, log, state, headline, str(chart_path)
+        measured_headline = f"{headline}\n\n{change_note}"
+        return str(output), str(flac_path), str(mp3_path) if mp3_path else None, log, state, measured_headline, str(chart_path)
 
 
 def process_audio(
@@ -566,7 +615,7 @@ def process_audio(
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
-            "Processamento iniciado. A barra superior mostra as etapas e o tempo restante estimado.",
+            "Processamento iniciado. O painel Progresso mostra as etapas e o tempo restante estimado.",
             "### Em andamento\nAguarde a reconstrução real da forma de onda.",
             gr.update(),
             current,
@@ -617,6 +666,16 @@ def compare_modes(
         destination = Path(current.get("job_dir") or _new_job_dir(source)) / "comparacao-inteligente"
         destination.mkdir(parents=True, exist_ok=True)
         original_ab, auto_ab, hard_ab, soft_ab = _loudness_matched_players(source, start_seconds, outputs, destination)
+        auto_signal, _ = sf.read(outputs[0], always_2d=True, dtype="float64")
+        hard_signal, _ = sf.read(outputs[1], always_2d=True, dtype="float64")
+        if np.array_equal(auto_signal, hard_signal):
+            logs.append(
+                "\nAutomático e Clipping duro ficaram numericamente idênticos neste trecho. "
+                "Isso é esperado quando o diagnóstico automático escolhe o tratamento de clipping duro."
+            )
+        else:
+            auto_hard_note, _metrics = _change_measurement(auto_signal, hard_signal)
+            logs.append("\nDiferença Automático × Clipping duro: " + auto_hard_note)
         logs.append("\nPlayers A/B ajustados para o mesmo volume perceptivo (LUFS), sem alterar os arquivos de download.")
         yield original_ab, auto_ab, hard_ab, soft_ab, "\n".join(logs), current, gpu_status()
     except Exception as exc:
@@ -776,8 +835,11 @@ def create_app() -> gr.Blocks:
                 diagnosis = gr.Markdown("### Diagnóstico\nEnvie um áudio para iniciar a análise oficial.")
                 with gr.Row(elem_classes="compact-actions"):
                     analysis_download = gr.DownloadButton("Baixar análise do clipping", visible=False)
-                    analysis_upload = gr.UploadButton("Selecionar análise .json", file_types=[".json"], file_count="single", type="filepath")
-                use_analysis = gr.Button("Usar análise selecionada")
+                    analysis_upload = gr.UploadButton("Reutilizar análise salva (.json) — opcional", file_types=[".json"], file_count="single", type="filepath")
+                gr.Markdown(
+                    "<span class='bd-note'>O JSON guarda os níveis medidos. Selecione apenas uma análise deste mesmo áudio "
+                    "ou da mesma cadeia de gravação; o carregamento é automático.</span>"
+                )
             with gr.Column(scale=4, elem_classes="bd-card"):
                 preset = gr.Radio(list(PRESET_KEYS), value="Normal", label="Qualidade (preset oficial)")
                 mode = gr.Radio(list(MODE_KEYS), value="Automático (Auto)", label="Tipo de recuperação")
@@ -788,6 +850,7 @@ def create_app() -> gr.Blocks:
                 run_button = gr.Button("Recuperar áudio", variant="primary")
                 compare_button = gr.Button("Comparação inteligente — 30 segundos")
                 clear_button = gr.Button("Limpar sessão")
+                progress_target = gr.Markdown("### Progresso\nAguardando uma tarefa.", elem_classes="bd-card")
 
         with gr.Accordion("Plano avançado — configurações diferentes por trecho", open=False):
             gr.Markdown("Adicione intervalos sem sobreposição. Cada trecho será analisado separadamente e unido ao original com transições de 50 ms.")
@@ -828,48 +891,61 @@ def create_app() -> gr.Blocks:
             inputs=[audio, preset, state],
             outputs=[diagnosis, logs, analysis_download, state, device, estimate, visualization],
             concurrency_limit=1,
+            show_progress_on=progress_target,
         )
-        use_analysis.click(
+        analysis_upload.upload(
             load_saved_analysis,
             inputs=[audio, analysis_upload, state],
             outputs=[diagnosis, logs, state],
             concurrency_limit=1,
+            show_progress_on=progress_target,
         )
         run_button.click(
             process_audio,
             inputs=[audio, preset, mode, duration, start_seconds, state],
             outputs=[recovered, download, download_flac, download_mp3, visualization, logs, result_summary, analysis_download, state, device],
             concurrency_limit=1,
+            show_progress_on=progress_target,
         )
         compare_button.click(
             compare_modes,
             inputs=[audio, preset, start_seconds, state],
             outputs=[compare_original, compare_auto, compare_hard, compare_soft, logs, state, device],
             concurrency_limit=1,
+            show_progress_on=progress_target,
         )
         add_segment_button.click(
             add_segment,
             inputs=[start_seconds, duration, preset, mode, segment_plan, state],
             outputs=[segment_plan, segment_status],
+            show_progress="hidden",
         )
         process_plan_button.click(
             process_segment_plan,
             inputs=[audio, segment_plan, state],
             outputs=[recovered, download, download_flac, download_mp3, visualization, logs, result_summary, analysis_download, state, device],
             concurrency_limit=1,
+            show_progress_on=progress_target,
         )
         for control in (preset, duration, start_seconds):
-            control.change(estimate_text, inputs=[preset, duration, start_seconds, state], outputs=estimate)
+            control.change(
+                estimate_text,
+                inputs=[preset, duration, start_seconds, state],
+                outputs=estimate,
+                show_progress="hidden",
+            )
         clear_button.click(
             clear_session,
             outputs=[audio, diagnosis, logs, recovered, download, download_flac, download_mp3, visualization, analysis_download, estimate, segment_plan, state, device],
             concurrency_limit=1,
+            show_progress="hidden",
         )
     return demo
 
 
 if __name__ == "__main__":
-    print(gpu_status())
+    console_encoding = sys.stdout.encoding or "utf-8"
+    print(gpu_status().encode(console_encoding, errors="replace").decode(console_encoding))
     create_app().queue(default_concurrency_limit=1, max_size=8).launch(
         server_name="0.0.0.0",
         server_port=int(os.getenv("PORT", "7860")),
