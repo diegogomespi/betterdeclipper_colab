@@ -1,0 +1,14 @@
+.venv/
+BetterDeclipper/
+gui/
+scripts/
+resultados/**
+!resultados/.gitkeep
+resultados_colab/
+README_PTBR.md
+INICIAR.bat
+INSTALAR.bat
+__pycache__/
+*.pyc
+*.log
+*.tmp
