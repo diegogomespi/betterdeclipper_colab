@@ -38,8 +38,18 @@ porcentagem de recuperação para gravações reais, que não possuem referênci
 
 ## Modelos não executados
 
-- SonicMaster: não executado; incompatibilidades e riscos descritos em `../SONICMASTER_AUDITORIA.md`.
+- SonicMaster: executado no endpoint oficial em um teste musical de 20 segundos; a saída teve 29,95 segundos e
+  piorou de 8,38 dB para 7,61 dB contra a referência. Foi rejeitado. Detalhes em `../SONICMASTER_AUDITORIA.md`.
 - Demucs HTDemucs-FT: não instalado nem executado, pois ainda não houve benefício demonstrado para este caso.
+
+## Restauração vocal
+
+- BetterDeclipper e DeepFilterNet3 foram executados sobre um vocal sintético distorcido e ruidoso de 20 segundos.
+- Ambos preservaram a quantidade exata de amostras.
+- O candidato DeepFilterNet3 piorou a métrica de 8,12 dB para 6,02 dB e foi rejeitado pelo filtro automático.
+- O arquivo principal manteve o candidato conservador do BetterDeclipper; o arquivo neural continuou disponível
+  separadamente para auditoria A/B.
+- Nenhum modelo de conversão, clonagem ou síntese de voz foi utilizado.
 
 O teste local não prova uso de T4. No Colab, a interface deve mostrar CUDA somente quando
 `torch.cuda.is_available()` for verdadeiro e deve registrar o dispositivo retornado pelo processamento.

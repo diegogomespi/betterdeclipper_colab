@@ -78,6 +78,18 @@ def main() -> int:
             raise RuntimeError("O modo automático não apresentou diagnóstico e seleção dos candidatos.")
         report["restauracao_automatica"] = automatic_wav.name
 
+        vocal_result = client.predict(handle_file(clipped_path), api_name="/process_vocal")
+        vocal_wav = path_from_output(vocal_result[1])
+        vocal_neural_test = path_from_output(vocal_result[2])
+        if sf.info(vocal_wav).frames != len(clipped) or sf.info(vocal_neural_test).frames != len(clipped):
+            raise RuntimeError("A restauração vocal alterou a duração do vocal importado.")
+        if "DeepFilterNet3" not in str(vocal_result[3]):
+            raise RuntimeError("O relatório vocal não comprovou a execução do modelo neural.")
+        report["restauracao_vocal"] = {
+            "selecionado": vocal_wav.name,
+            "candidato_neural": vocal_neural_test.name,
+        }
+
         loaded = client.predict(handle_file(clipped_path), handle_file(analysis_path), api_name="/load_saved_analysis")
         if "carregada" not in str(loaded[0]).lower():
             raise RuntimeError(f"A análise JSON não foi reutilizada: {loaded}")

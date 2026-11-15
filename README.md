@@ -1,6 +1,6 @@
 # BetterDeclipper AI Studio
 
-Interface Gradio em português para diagnóstico e restauração musical automática com o [BetterDeclipper oficial](https://github.com/Qupci/BetterDeclipper) no Google Colab, usando GPU NVIDIA somente quando o PyTorch confirma CUDA.
+Interface Gradio completa em português para diagnóstico e restauração musical com o [BetterDeclipper oficial](https://github.com/Qupci/BetterDeclipper) no Google Colab, usando GPU NVIDIA somente quando o PyTorch confirma CUDA.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/diegogomespi/betterdeclipper_colab/blob/main/betterdeclipper_colab.ipynb)
 
@@ -17,17 +17,18 @@ Ao encerrar ou reiniciar a sessão do Colab, os arquivos temporários são apaga
 2. No Colab, abra **Ambiente de execução → Alterar tipo de ambiente de execução** e selecione **T4 GPU**.
 3. Execute a célula **INICIAR BETTERDECLIPPER**.
 4. Confirme que o diagnóstico mostra `cuda_available: True` e o nome da GPU. Se CUDA não estiver disponível, o sistema funciona em CPU e avisa que poderá ser lento.
-5. Envie WAV, FLAC ou MP3.
-6. Clique em **Analisar e restaurar automaticamente**.
-7. O controlador escolhe um trecho representativo, testa candidatos, descarta alterações inseguras e processa a música completa.
-8. Ouça original e restaurado e baixe o resultado principal em WAV PCM de 24 bits.
+5. Envie WAV, FLAC ou MP3. O diagnóstico começa automaticamente.
+6. Escolha Fast, Normal, High ou Best; Auto, Hard, Soft ou Limiter; e 15, 30, 60 segundos ou música completa.
+7. Clique em **Recuperar áudio**. Use a comparação A/B e o plano por trechos quando necessário.
+8. Baixe WAV PCM 24 bits, FLAC 24 bits ou MP3 320 kbps.
+9. O modo inteligente continua disponível como opção adicional e não substitui os controles manuais.
 
 O link Gradio compartilhado é temporário e existe somente enquanto a célula estiver em execução. Não compartilhe esse endereço se o áudio for confidencial.
 
 ## Recursos
 
 - Interface, relatórios, botões e mensagens em português do Brasil.
-- Fluxo principal com apenas upload, um botão automático, progresso, players e download WAV.
+- Interface completa preservada: presets, modos, trechos, JSON, comparação A/B, gráficos e três formatos de exportação.
 - Seleção automática do trecho sustentado de maior energia para o teste inicial.
 - Controlador que compara Auto, Hard e Soft, mede correlação, diferença RMS, desvio espectral e impulsos, e rejeita candidatos com artefatos evidentes.
 - Escolha automática do preset final conforme duração e GPU confirmada.
@@ -47,6 +48,8 @@ O link Gradio compartilhado é temporário e existe somente enquanto a célula e
 - Progresso real por etapas, tempo restante aproximado e logs detalhados.
 - Exportação WAV PCM 24 bits, FLAC 24 bits e MP3 320 kbps, mantendo a taxa de amostragem original.
 - Bloqueio de processamento simultâneo e separação entre entrada e resultados.
+- Importação de vocal já separado e restauração áudio-para-áudio com BetterDeclipper e teste real do DeepFilterNet3.
+- Rejeição automática do DeepFilterNet3 quando ele altera excessivamente o timbre ou o espectro do vocal.
 
 ## Observações técnicas
 
@@ -69,15 +72,15 @@ o sistema preserva o sinal e informa a limitação.
 
 ## SonicMaster e Demucs
 
-O SonicMaster foi auditado, mas não é executado nesta versão: o pipeline oficial ainda não preserva a duração do
-último bloco e o Space oficial usa A10G, não T4. O checkpoint tem cerca de 3,45 GB e depende de FLAN-T5 Large e do
-VAE Stable Audio, que possui licença própria. Consulte [SONICMASTER_AUDITORIA.md](SONICMASTER_AUDITORIA.md).
+O SonicMaster foi executado de verdade no endpoint oficial com um teste sintético de 20 segundos. A saída teve
+29,95 segundos e piorou a métrica contra a referência limpa; por isso foi rejeitado e não virou botão de
+restauração. O Space oficial usa A10G, não T4. Consulte [SONICMASTER_AUDITORIA.md](SONICMASTER_AUDITORIA.md).
 
 Demucs HTDemucs-FT também não é instalado automaticamente enquanto não houver benefício demonstrado para este caso.
 
 ## Etapas seguintes
 
-- **Segunda etapa:** importação e tratamento individual de stems existentes (voz, baixo, bateria e outros) e mixagem com volume/panorama. Nenhuma separação automática será obrigatória.
+- **Segunda etapa:** importação do vocal existente já implementada; baixo, bateria, outros stems e mixagem permanecem em validação.
 - **Terceira etapa:** reconstrução instrumental opcional por transcrição MIDI e instrumentos virtuais, em módulo separado e claramente identificado. Não será apresentada equalização como reconstrução.
 
 ## Estrutura
@@ -88,6 +91,7 @@ Demucs HTDemucs-FT também não é instalado automaticamente enquanto não houve
 - `betterdeclipper_colab.ipynb`: notebook de uma célula para o Colab.
 - `testes/validar_colab.py`: validação com WAV sintético realmente clipado.
 - `audio_diagnostics.py`: seleção de trecho, diagnóstico DSP e filtro de segurança dos candidatos.
+- `voice_restoration.py`: restauração do vocal importado com preservação de duração e filtro de segurança.
 - `SONICMASTER_AUDITORIA.md`: compatibilidade, dependências, licença e bloqueios encontrados.
 
 ## Licenças

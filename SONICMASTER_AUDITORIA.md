@@ -33,9 +33,21 @@ memória demais em músicas longas. O fato de funcionar no Space A10G não compr
 
 ## Decisão desta versão
 
-O SonicMaster não é baixado nem executado pelo botão automático. A interface informa essa limitação e usa
-o BetterDeclipper oficial, que foi validado localmente com referência limpa conhecida. Isso evita um download
-de vários gigabytes e impede que um modelo não validado seja apresentado como funcional.
+O SonicMaster foi executado no endpoint oficial dos autores com um sinal musical sintético de 20 segundos,
+severamente saturado, clipado e com ruído. A inferência informou 6,60 segundos de processamento, mas entregou
+29,9537 segundos de áudio, confirmando o preenchimento não removido do último bloco.
+
+Comparação contra a referência limpa, após ajuste de ganho apenas para a medição:
+
+| Sinal | SNR | Correlação | Duração |
+|---|---:|---:|---:|
+| Entrada degradada | 8,38 dB | 0,924610 | 20,00 s |
+| BetterDeclipper `fast/auto` | 25,16 dB | 0,998475 | 20,00 s |
+| SonicMaster oficial, primeiros 20 s | 7,61 dB | 0,909242 | 29,95 s no arquivo |
+
+Nesse teste o SonicMaster piorou o resultado e alterou a duração. Ele foi corretamente rejeitado e não é
+baixado nem executado pelo botão do projeto. Isso impede que um modelo generativo não aprovado seja apresentado
+como restauração funcional.
 
 Para habilitação futura serão necessários, no mínimo:
 

@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import pyloudnorm as pyln  # noqa: E402
 
 from audio_diagnostics import candidate_metrics, diagnose_signal, format_diagnosis_pt, representative_window  # noqa: E402
+from voice_restoration import deepfilternet_available, restore_vocal  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent
@@ -901,6 +902,65 @@ def automatic_restore(
         PROCESS_LOCK.release()
 
 
+def process_vocal(
+    vocal_audio: Any,
+    progress: gr.Progress = gr.Progress(),
+) -> tuple[Any, ...]:
+    source = _source_path(vocal_audio)
+    if not PROCESS_LOCK.acquire(blocking=False):
+        raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
+    try:
+        available, reason = deepfilternet_available()
+        if not available:
+            raise RuntimeError(reason)
+        job_dir = _new_job_dir(source) / "restauracao-vocal"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        output = job_dir / f"{_safe_name(source.stem)}_vocal_restaurado_24bit.wav"
+
+        def on_progress(value: float, message: str) -> None:
+            progress(value, desc=message)
+
+        started = time.time()
+        restored_path, info = restore_vocal(
+            source,
+            output,
+            progress=on_progress,
+            preset="normal" if torch.cuda.is_available() else "fast",
+            noise_attenuation_limit_db=12.0,
+        )
+        neural_path = Path(str(info["neural_candidate_path"]))
+        accepted = bool(info["neural_candidate_accepted"])
+        verdict = (
+            "O DeepFilterNet3 passou no filtro de segurança e foi incluído no vocal restaurado."
+            if accepted
+            else "O DeepFilterNet3 foi executado, mas rejeitado; o arquivo principal usa somente BetterDeclipper."
+        )
+        log = "\n".join(
+            [
+                f"Restauração vocal concluída em {_format_seconds(time.time() - started)}.",
+                f"Motor selecionado: {info['engine_selected']}.",
+                f"Clipping/saturação marcados: {100 * float(info['clipped_fraction']):.3f}%.",
+                f"Dispositivo BetterDeclipper: {info['device_clipping']}.",
+                f"Dispositivo DeepFilterNet3: {info['device_noise']}.",
+                verdict,
+                f"Filtro de segurança: {info['neural_candidate_reason']}.",
+                "O cantor não foi sintetizado nem substituído; ambos os motores são áudio-para-áudio.",
+                f"Vocal principal: {restored_path}",
+                f"Candidato neural para conferência A/B: {neural_path}",
+            ]
+        )
+        return (
+            gr.update(value=str(restored_path), visible=True),
+            gr.update(value=str(restored_path), visible=True),
+            gr.update(value=str(neural_path), visible=True),
+            log,
+        )
+    except Exception as exc:
+        raise gr.Error(f"Falha na restauração vocal: {type(exc).__name__}: {exc}") from exc
+    finally:
+        PROCESS_LOCK.release()
+
+
 def add_segment(
     start_seconds: float,
     duration: str,
@@ -1042,76 +1102,67 @@ def create_app() -> gr.Blocks:
         state = gr.State(_blank_state())
         gr.HTML(
             "<section class='bd-hero'><h1>BetterDeclipper AI Studio</h1>"
-            "<p>Restauração musical automática: envie o áudio, clique uma vez e acompanhe a análise.</p></section>"
+            "<p>Diagnóstico e recuperação real de gravações distorcidas, com a API oficial BetterDeclipper.</p></section>"
         )
         device = gr.Markdown(gpu_status(), elem_classes="bd-card")
 
         with gr.Row(equal_height=False):
             with gr.Column(scale=6, elem_classes="bd-card"):
                 audio = gr.Audio(label="Áudio original — WAV, FLAC ou MP3", type="filepath", sources=["upload"])
-            with gr.Column(scale=4, elem_classes="bd-card"):
-                automatic_button = gr.Button("Analisar e restaurar automaticamente", variant="primary", size="lg")
+                diagnosis = gr.Markdown("### Diagnóstico\nEnvie um áudio para iniciar a análise oficial.")
+                with gr.Row(elem_classes="compact-actions"):
+                    analysis_download = gr.DownloadButton("Baixar análise do clipping", visible=False)
+                    analysis_upload = gr.UploadButton("Reutilizar análise salva (.json) — opcional", file_types=[".json"], file_count="single", type="filepath")
                 gr.Markdown(
-                    "<span class='bd-note'>O sistema escolhe um trecho representativo, testa os modos compatíveis, "
-                    "descarta candidatos com artefatos evidentes e processa a música completa.</span>"
+                    "<span class='bd-note'>O JSON guarda os níveis medidos. Selecione apenas uma análise deste mesmo áudio "
+                    "ou da mesma cadeia de gravação; o carregamento é automático.</span>"
                 )
-                progress_target = gr.Markdown("### Progresso\nAguardando uma tarefa.", elem_classes="bd-card")
-
-        diagnosis = gr.Markdown("### Diagnóstico automático\nEnvie um áudio e clique no botão de restauração automática.")
-        with gr.Row():
-            recovered = gr.Audio(label="Áudio recuperado", type="filepath", visible=False)
-            with gr.Column():
-                download = gr.DownloadButton("Baixar WAV PCM 24 bits", visible=False, variant="primary")
-        result_summary = gr.Markdown("### Resultado\nAguardando processamento.")
-
-        with gr.Accordion("Recursos avançados e relatório técnico", open=False):
-            visualization = gr.Image(label="Formas de onda, espectrogramas e regiões alteradas", visible=False, interactive=False)
-            logs = gr.Textbox(label="Logs, diagnóstico DSP e decisões automáticas", value="Pronto.", lines=12, max_lines=30, interactive=False)
-            with gr.Row(elem_classes="compact-actions"):
-                analysis_download = gr.DownloadButton("Baixar análise do clipping", visible=False)
-                analysis_upload = gr.UploadButton("Reutilizar análise salva (.json)", file_types=[".json"], file_count="single", type="filepath")
-            gr.Markdown(
-                "<span class='bd-note'>O JSON guarda os níveis medidos pelo BetterDeclipper. Use apenas com o mesmo áudio "
-                "ou com uma gravação da mesma cadeia.</span>"
-            )
-
-            with gr.Accordion("Controles manuais do BetterDeclipper", open=False):
+            with gr.Column(scale=4, elem_classes="bd-card"):
                 preset = gr.Radio(list(PRESET_KEYS), value="Normal", label="Qualidade (preset oficial)")
                 mode = gr.Radio(list(MODE_KEYS), value="Automático (Auto)", label="Tipo de recuperação")
                 duration = gr.Radio(["15 segundos", "30 segundos", "60 segundos", "Música completa"], value="15 segundos", label="Duração a processar")
                 start_seconds = gr.Number(value=0, minimum=0, label="Início do trecho (segundos)")
-                estimate = gr.Markdown("### Tempo estimado\nFaça o diagnóstico técnico para obter uma estimativa.")
-                with gr.Row():
-                    advanced_analyze_button = gr.Button("Executar diagnóstico técnico")
-                    run_button = gr.Button("Recuperar com configuração manual", variant="primary")
-                    compare_button = gr.Button("Comparar Auto × Hard × Soft")
-                with gr.Row():
-                    download_flac = gr.DownloadButton("Baixar FLAC 24 bits", visible=False)
-                    download_mp3 = gr.DownloadButton("Baixar MP3 320 kbps", visible=False)
+                estimate = gr.Markdown("### Tempo estimado\nA estimativa aparecerá depois do diagnóstico inicial.")
+                gr.Markdown("<span class='bd-note'>O modo Limiter é experimental. A exportação recebe somente atenuação de segurança quando necessária para não criar novo clipping.</span>")
+                run_button = gr.Button("Recuperar áudio", variant="primary")
+                compare_button = gr.Button("Comparação inteligente — 30 segundos")
+                clear_button = gr.Button("Limpar sessão")
+                progress_target = gr.Markdown("### Progresso\nAguardando uma tarefa.", elem_classes="bd-card")
 
-            with gr.Accordion("Plano por trechos", open=False):
-                gr.Markdown("Adicione intervalos sem sobreposição. As junções usam transições de 50 ms.")
-                segment_plan = gr.Dataframe(
-                    headers=["Início (s)", "Fim (s)", "Qualidade", "Recuperação"],
-                    datatype=["number", "number", "str", "str"],
-                    row_count=0,
-                    col_count=(4, "fixed"),
-                    type="array",
-                    interactive=True,
-                    label="Trechos configurados",
-                )
-                with gr.Row():
-                    add_segment_button = gr.Button("Adicionar configuração atual")
-                    process_plan_button = gr.Button("Processar plano", variant="primary")
-                segment_status = gr.Markdown("Nenhum trecho adicionado.")
-
-            gr.Markdown(
-                "### Modelos experimentais\n"
-                "SonicMaster ainda não é executado automaticamente: o pipeline oficial não preserva a duração do último bloco "
-                "e ainda não foi validado em uma T4 para músicas longas. Demucs não é instalado sem benefício demonstrado."
+        with gr.Accordion("Plano avançado — configurações diferentes por trecho", open=False):
+            gr.Markdown("Adicione intervalos sem sobreposição. Cada trecho será analisado separadamente e unido ao original com transições de 50 ms.")
+            segment_plan = gr.Dataframe(
+                headers=["Início (s)", "Fim (s)", "Qualidade", "Recuperação"],
+                datatype=["number", "number", "str", "str"],
+                row_count=0,
+                col_count=(4, "fixed"),
+                type="array",
+                interactive=True,
+                label="Trechos configurados",
             )
+            with gr.Row():
+                add_segment_button = gr.Button("Adicionar configuração atual ao plano")
+                process_plan_button = gr.Button("Processar plano de trechos", variant="primary")
+            segment_status = gr.Markdown("Nenhum trecho adicionado.")
 
-        with gr.Accordion("Players A/B avançados — volumes perceptivos equivalentes", open=False):
+        with gr.Accordion("Modo inteligente BetterDeclipper — opcional", open=False):
+            gr.Markdown(
+                "Testa Auto, Hard e Soft em um trecho representativo, descarta candidatos com artefatos evidentes "
+                "e processa a música completa. Este modo não executa SonicMaster, Demucs ou reconstrução instrumental."
+            )
+            automatic_button = gr.Button("Analisar e restaurar automaticamente", variant="secondary")
+
+        with gr.Row():
+            recovered = gr.Audio(label="Áudio recuperado", type="filepath", visible=False)
+            with gr.Column():
+                download = gr.DownloadButton("Baixar WAV PCM 24 bits", visible=False, variant="primary")
+                download_flac = gr.DownloadButton("Baixar FLAC 24 bits", visible=False)
+                download_mp3 = gr.DownloadButton("Baixar MP3 320 kbps", visible=False)
+        result_summary = gr.Markdown("### Resultado\nAguardando processamento.")
+        visualization = gr.Image(label="Formas de onda, espectrogramas e regiões alteradas", visible=False, interactive=False)
+        logs = gr.Textbox(label="Logs e diagnóstico detalhado", value="Pronto.", lines=9, max_lines=20, interactive=False)
+
+        with gr.Accordion("Players A/B — volumes perceptivos equivalentes", open=False):
             with gr.Row():
                 compare_original = gr.Audio(label="Original (A)", type="filepath")
                 compare_auto = gr.Audio(label="Automático", type="filepath")
@@ -1119,16 +1170,28 @@ def create_app() -> gr.Blocks:
                 compare_hard = gr.Audio(label="Clipping duro", type="filepath")
                 compare_soft = gr.Audio(label="Saturação suave", type="filepath")
 
-        clear_button = gr.Button("Limpar sessão")
+        with gr.Accordion("Restaurar vocal já separado", open=False):
+            gr.Markdown(
+                "Importe o vocal existente. O BetterDeclipper trata clipping/saturação e o DeepFilterNet3 é testado "
+                "para ruído. Se o modelo neural alterar demais o timbre, ele é rejeitado automaticamente."
+            )
+            vocal_audio = gr.Audio(label="Vocal original separado", type="filepath", sources=["upload"])
+            restore_vocal_button = gr.Button("Restaurar vocal", variant="primary")
+            with gr.Row():
+                vocal_restored = gr.Audio(label="Vocal restaurado selecionado", type="filepath", visible=False)
+                vocal_neural_candidate = gr.Audio(label="Teste DeepFilterNet3 para comparação", type="filepath", visible=False)
+            vocal_download = gr.DownloadButton("Baixar vocal restaurado WAV 24 bits", visible=False)
+            vocal_log = gr.Textbox(label="Relatório da restauração vocal", interactive=False, lines=7)
 
-        automatic_button.click(
-            automatic_restore,
-            inputs=[audio, state],
-            outputs=[diagnosis, recovered, download, visualization, logs, result_summary, analysis_download, state, device],
-            concurrency_limit=1,
-            show_progress_on=progress_target,
-        )
-        advanced_analyze_button.click(
+        with gr.Accordion("Reconstruir instrumental — ainda não habilitado", open=False):
+            gr.Markdown(
+                "Não há botão falso nesta versão. Demucs HTDemucs-FT cabe em uma T4, mas Basic Pitch exige um "
+                "ambiente TensorFlow separado e não transcreve bateria com fidelidade suficiente para prometer uma "
+                "reconstrução completa. A função será habilitada somente depois de gerar baixo, harmonia e bateria "
+                "novos, preservar sincronização e passar no teste de 20–30 segundos."
+            )
+
+        audio.upload(
             analyze_upload,
             inputs=[audio, preset, state],
             outputs=[diagnosis, logs, analysis_download, state, device, estimate, visualization],
@@ -1146,6 +1209,20 @@ def create_app() -> gr.Blocks:
             process_audio,
             inputs=[audio, preset, mode, duration, start_seconds, state],
             outputs=[recovered, download, download_flac, download_mp3, visualization, logs, result_summary, analysis_download, state, device],
+            concurrency_limit=1,
+            show_progress_on=progress_target,
+        )
+        automatic_button.click(
+            automatic_restore,
+            inputs=[audio, state],
+            outputs=[diagnosis, recovered, download, visualization, logs, result_summary, analysis_download, state, device],
+            concurrency_limit=1,
+            show_progress_on=progress_target,
+        )
+        restore_vocal_button.click(
+            process_vocal,
+            inputs=[vocal_audio],
+            outputs=[vocal_restored, vocal_download, vocal_neural_candidate, vocal_log],
             concurrency_limit=1,
             show_progress_on=progress_target,
         )
@@ -1183,7 +1260,6 @@ def create_app() -> gr.Blocks:
             show_progress="hidden",
         )
     return demo
-
 
 if __name__ == "__main__":
     console_encoding = sys.stdout.encoding or "utf-8"

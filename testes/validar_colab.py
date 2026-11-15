@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 import app
 from audio_diagnostics import candidate_metrics, diagnose_signal, representative_window
 from betterdeclipper import declip
+from voice_restoration import restore_vocal
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -87,6 +88,19 @@ def main() -> int:
             raise RuntimeError("O controlador não registrou a comparação dos candidatos.")
         if "SonicMaster não foi executado" not in str(automatic_final[4]):
             raise RuntimeError("O relatório não registrou corretamente a situação do SonicMaster.")
+
+        vocal_clean = 0.5 * np.sin(2 * np.pi * 190 * np.arange(sr * 2) / sr)
+        vocal_damaged = np.clip(vocal_clean * 2.5, -0.32, 0.32)
+        vocal_source = tmp_path / "vocal_separado_clipado.wav"
+        vocal_output = tmp_path / "vocal_restaurado.wav"
+        sf.write(vocal_source, vocal_damaged, sr, subtype="FLOAT")
+        vocal_path, vocal_info = restore_vocal(vocal_source, vocal_output, preset="fast")
+        if not vocal_path.is_file() or sf.info(vocal_path).frames != len(vocal_clean):
+            raise RuntimeError("A restauração vocal não preservou o arquivo e sua duração.")
+        if vocal_info.get("identity_replaced") is not False:
+            raise RuntimeError("A restauração vocal declarou substituição indevida da identidade.")
+        if not Path(str(vocal_info.get("neural_candidate_path"))).is_file():
+            raise RuntimeError("O candidato DeepFilterNet3 não foi realmente gerado.")
 
     demo = app.create_app()
     if demo is None:
