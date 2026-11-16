@@ -1176,7 +1176,9 @@ def create_app() -> gr.Blocks:
 
         with gr.Accordion("Restaurar vocal já separado", open=False):
             gr.Markdown(
-                "Importe o vocal existente. O BetterDeclipper trata clipping/saturação. "
+                "Use esta área somente se você já possui um arquivo contendo apenas a voz, sem o instrumental. "
+                "Para uma música completa, use o envio principal no topo da página. "
+                "No vocal separado, o BetterDeclipper trata clipping/saturação. "
                 + (
                     "O DeepFilterNet3 também será testado para ruído e rejeitado se alterar demais o timbre."
                     if vocal_neural_available

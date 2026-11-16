@@ -8,7 +8,13 @@ import sys
 import time
 from pathlib import Path
 
-from IPython import display
+try:
+    from IPython import display
+except ImportError:  # Permite validar o launcher fora do notebook.
+    display = None
+
+
+PROJECT_MODULES = ("app", "audio_diagnostics", "voice_restoration")
 
 
 def _run(command: list[str], cwd: str | Path | None = None) -> None:
@@ -45,6 +51,13 @@ def _torch_report() -> dict[str, object]:
     return report
 
 
+def _clear_cached_project_modules() -> None:
+    """Evita misturar código antigo e novo ao executar novamente a célula do Colab."""
+    importlib.invalidate_caches()
+    for module_name in PROJECT_MODULES:
+        sys.modules.pop(module_name, None)
+
+
 def _status_card(report: dict[str, object], share_url: str | None = None) -> None:
     cuda = bool(report["cuda_available"])
     color = "#30d89b" if cuda else "#f6b94a"
@@ -56,6 +69,9 @@ def _status_card(report: dict[str, object], share_url: str | None = None) -> Non
         if share_url
         else ""
     )
+    if display is None:
+        print(f"{title}: {device} · PyTorch {report['torch']} · build CUDA {report['torch_cuda_build']}", flush=True)
+        return
     display.display(
         display.HTML(
             f"""
@@ -100,8 +116,8 @@ def run_from_colab(
     os.environ["BETTERDECLIPPER_OUTPUT_DIR"] = "/content/betterdeclipper_resultados"
     if str(repo_dir) not in sys.path:
         sys.path.insert(0, str(repo_dir))
+    _clear_cached_project_modules()
     app = importlib.import_module("app")
-    app = importlib.reload(app)
     print(f"BetterDeclipper oficial carregado: {app.betterdeclipper_version}", flush=True)
 
     demo = app.create_app().queue(default_concurrency_limit=1, max_size=8)

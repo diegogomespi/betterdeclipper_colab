@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import app
+import colab_launcher
 from audio_diagnostics import candidate_metrics, diagnose_signal, representative_window
 from betterdeclipper import declip
 from voice_restoration import deepfilternet_available, restore_vocal
@@ -23,6 +24,19 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def main() -> int:
+    cached_app = sys.modules.get("app")
+    cached_diagnostics = sys.modules.get("audio_diagnostics")
+    cached_vocal = sys.modules.get("voice_restoration")
+    colab_launcher._clear_cached_project_modules()
+    if any(name in sys.modules for name in colab_launcher.PROJECT_MODULES):
+        raise RuntimeError("O launcher não limpou os módulos antigos da sessão Colab.")
+    if cached_app is not None:
+        sys.modules["app"] = cached_app
+    if cached_diagnostics is not None:
+        sys.modules["audio_diagnostics"] = cached_diagnostics
+    if cached_vocal is not None:
+        sys.modules["voice_restoration"] = cached_vocal
+
     sr = 16_000
     t = np.arange(int(sr * 0.75), dtype=np.float64) / sr
     clean = 0.8 * np.sin(2 * np.pi * 220 * t) + 0.35 * np.sin(2 * np.pi * 440 * t)
