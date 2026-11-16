@@ -910,9 +910,6 @@ def process_vocal(
     if not PROCESS_LOCK.acquire(blocking=False):
         raise gr.Error("Já existe um processamento em execução. Aguarde a conclusão.")
     try:
-        available, reason = deepfilternet_available()
-        if not available:
-            raise RuntimeError(reason)
         job_dir = _new_job_dir(source) / "restauracao-vocal"
         job_dir.mkdir(parents=True, exist_ok=True)
         output = job_dir / f"{_safe_name(source.stem)}_vocal_restaurado_24bit.wav"

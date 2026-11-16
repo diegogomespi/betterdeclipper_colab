@@ -139,6 +139,24 @@ def main() -> int:
         if fallback_info.get("neural_candidate_path") is not None:
             raise RuntimeError("O fallback declarou um candidato neural que não foi executado.")
 
+        app.OUTPUT_ROOT = tmp_path / "interface-vocal-sem-deepfilternet"
+        with (
+            patch(
+                "app.deepfilternet_available",
+                return_value=(False, "DeepFilterNet não instalado."),
+            ),
+            patch(
+                "voice_restoration.deepfilternet_available",
+                return_value=(False, "DeepFilterNet não instalado."),
+            ),
+        ):
+            vocal_updates = app.process_vocal(str(vocal_source), Progress())
+        vocal_interface_value = vocal_updates[0].get("value")
+        if not vocal_interface_value or not Path(str(vocal_interface_value)).is_file():
+            raise RuntimeError("O botão de restauração vocal falhou sem DeepFilterNet.")
+        if "Motor selecionado: BetterDeclipper" not in str(vocal_updates[3]):
+            raise RuntimeError("A interface não registrou o fallback real para BetterDeclipper.")
+
     demo = app.create_app()
     if demo is None:
         raise RuntimeError("A interface Gradio não foi criada.")
