@@ -48,8 +48,9 @@ O link Gradio compartilhado é temporário e existe somente enquanto a célula e
 - Progresso real por etapas, tempo restante aproximado e logs detalhados.
 - Exportação WAV PCM 24 bits, FLAC 24 bits e MP3 320 kbps, mantendo a taxa de amostragem original.
 - Bloqueio de processamento simultâneo e separação entre entrada e resultados.
-- Importação de vocal já separado e restauração áudio-para-áudio com BetterDeclipper e teste real do DeepFilterNet3.
-- Rejeição automática do DeepFilterNet3 quando ele altera excessivamente o timbre ou o espectro do vocal.
+- Importação de vocal já separado e restauração áudio-para-áudio com BetterDeclipper.
+- Teste opcional do DeepFilterNet3 somente em versões de Python compatíveis; no Colab com Python 3.13 ele é ignorado sem interromper o BetterDeclipper.
+- Rejeição automática do DeepFilterNet3, quando disponível, se ele alterar excessivamente o timbre ou o espectro do vocal.
 
 ## Observações técnicas
 

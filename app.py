@@ -928,11 +928,14 @@ def process_vocal(
             preset="normal" if torch.cuda.is_available() else "fast",
             noise_attenuation_limit_db=12.0,
         )
-        neural_path = Path(str(info["neural_candidate_path"]))
+        neural_value = info.get("neural_candidate_path")
+        neural_path = Path(str(neural_value)) if neural_value else None
         accepted = bool(info["neural_candidate_accepted"])
         verdict = (
             "O DeepFilterNet3 passou no filtro de segurança e foi incluído no vocal restaurado."
             if accepted
+            else "O DeepFilterNet3 não é compatível com o Python desta sessão; o vocal foi tratado pelo BetterDeclipper."
+            if not neural_path
             else "O DeepFilterNet3 foi executado, mas rejeitado; o arquivo principal usa somente BetterDeclipper."
         )
         log = "\n".join(
@@ -946,13 +949,13 @@ def process_vocal(
                 f"Filtro de segurança: {info['neural_candidate_reason']}.",
                 "O cantor não foi sintetizado nem substituído; ambos os motores são áudio-para-áudio.",
                 f"Vocal principal: {restored_path}",
-                f"Candidato neural para conferência A/B: {neural_path}",
+                f"Candidato neural para conferência A/B: {neural_path}" if neural_path else "Candidato neural não gerado nesta sessão.",
             ]
         )
         return (
             gr.update(value=str(restored_path), visible=True),
             gr.update(value=str(restored_path), visible=True),
-            gr.update(value=str(neural_path), visible=True),
+            gr.update(value=str(neural_path) if neural_path else None, visible=bool(neural_path)),
             log,
         )
     except Exception as exc:
@@ -1100,6 +1103,7 @@ def clear_session() -> tuple[Any, ...]:
 def create_app() -> gr.Blocks:
     with gr.Blocks(css=CSS, theme=gr.themes.Base(primary_hue="emerald", neutral_hue="slate"), title="BetterDeclipper Colab") as demo:
         state = gr.State(_blank_state())
+        vocal_neural_available, vocal_neural_reason = deepfilternet_available()
         gr.HTML(
             "<section class='bd-hero'><h1>BetterDeclipper AI Studio</h1>"
             "<p>Diagnóstico e recuperação real de gravações distorcidas, com a API oficial BetterDeclipper.</p></section>"
@@ -1172,8 +1176,12 @@ def create_app() -> gr.Blocks:
 
         with gr.Accordion("Restaurar vocal já separado", open=False):
             gr.Markdown(
-                "Importe o vocal existente. O BetterDeclipper trata clipping/saturação e o DeepFilterNet3 é testado "
-                "para ruído. Se o modelo neural alterar demais o timbre, ele é rejeitado automaticamente."
+                "Importe o vocal existente. O BetterDeclipper trata clipping/saturação. "
+                + (
+                    "O DeepFilterNet3 também será testado para ruído e rejeitado se alterar demais o timbre."
+                    if vocal_neural_available
+                    else f"O denoiser neural não será executado nesta sessão: {vocal_neural_reason}"
+                )
             )
             vocal_audio = gr.Audio(label="Vocal original separado", type="filepath", sources=["upload"])
             restore_vocal_button = gr.Button("Restaurar vocal", variant="primary")

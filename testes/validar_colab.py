@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 import sys
 
@@ -14,7 +15,7 @@ if str(ROOT) not in sys.path:
 import app
 from audio_diagnostics import candidate_metrics, diagnose_signal, representative_window
 from betterdeclipper import declip
-from voice_restoration import restore_vocal
+from voice_restoration import deepfilternet_available, restore_vocal
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -99,8 +100,30 @@ def main() -> int:
             raise RuntimeError("A restauração vocal não preservou o arquivo e sua duração.")
         if vocal_info.get("identity_replaced") is not False:
             raise RuntimeError("A restauração vocal declarou substituição indevida da identidade.")
-        if not Path(str(vocal_info.get("neural_candidate_path"))).is_file():
+        neural_available, _neural_reason = deepfilternet_available()
+        neural_path = vocal_info.get("neural_candidate_path")
+        if neural_available and (not neural_path or not Path(str(neural_path)).is_file()):
             raise RuntimeError("O candidato DeepFilterNet3 não foi realmente gerado.")
+        if not neural_available and neural_path is not None:
+            raise RuntimeError("Foi declarado candidato neural sem modelo compatível instalado.")
+
+        fallback_path = tmp_path / "vocal_restaurado_sem_deepfilternet.wav"
+        with patch(
+            "voice_restoration.deepfilternet_available",
+            return_value=(False, "DeepFilterNet indisponível no Python 3.13 do Colab."),
+        ):
+            fallback_restored, fallback_info = restore_vocal(
+                source=vocal_source,
+                destination=fallback_path,
+                preset="fast",
+            )
+        fallback_audio, fallback_sr = sf.read(fallback_restored, always_2d=True)
+        if fallback_sr != sr or len(fallback_audio) != len(vocal_clean):
+            raise RuntimeError("O fallback vocal sem DeepFilterNet não preservou taxa ou duração.")
+        if fallback_info.get("engine_selected") != "BetterDeclipper":
+            raise RuntimeError("O fallback vocal não declarou corretamente o BetterDeclipper.")
+        if fallback_info.get("neural_candidate_path") is not None:
+            raise RuntimeError("O fallback declarou um candidato neural que não foi executado.")
 
     demo = app.create_app()
     if demo is None:

@@ -47,6 +47,7 @@ porcentagem de recuperação para gravações reais, que não possuem referênci
 - BetterDeclipper e DeepFilterNet3 foram executados sobre um vocal sintético distorcido e ruidoso de 20 segundos.
 - Ambos preservaram a quantidade exata de amostras.
 - O candidato DeepFilterNet3 piorou a métrica de 8,12 dB para 6,02 dB e foi rejeitado pelo filtro automático.
+- Esse ensaio neural foi feito localmente em Python compatível. O Colab atual usa Python 3.13, para o qual o DeepFilterNet 0.5.6 não publica wheel; nesse ambiente o sistema executa o BetterDeclipper e informa que o denoiser neural não foi usado.
 - O arquivo principal manteve o candidato conservador do BetterDeclipper; o arquivo neural continuou disponível
   separadamente para auditoria A/B.
 - Nenhum modelo de conversão, clonagem ou síntese de voz foi utilizado.

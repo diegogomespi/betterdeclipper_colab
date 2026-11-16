@@ -101,47 +101,54 @@ def restore_vocal(
     )
 
     available, reason = deepfilternet_available()
-    if not available:
-        raise RuntimeError(reason)
-    notify(0.45, "Carregando o modelo neural DeepFilterNet3...")
-    _install_torchaudio_import_shim()
-    from df.enhance import enhance, init_df
+    neural_candidate_path: Path | None = None
+    neural_accepted = False
+    neural_reason = reason
+    model_name = "indisponível neste Python"
+    device_noise = "não executado"
+    selected = declipped
+    if available:
+        notify(0.45, "Carregando o modelo neural DeepFilterNet3...")
+        _install_torchaudio_import_shim()
+        from df.enhance import enhance, init_df
 
-    model, df_state, model_name = init_df(
-        default_model="DeepFilterNet3",
-        post_filter=False,
-        log_file=None,
-        log_level="WARNING",
-    )
-    model_sr = 48_000
-    model_audio = _resample(declipped, sr, model_sr)
-    tensor = torch.from_numpy(model_audio.T.astype(np.float32, copy=False))
-    notify(0.62, "Reduzindo ruído do vocal com o modelo neural...")
-    enhanced = enhance(
-        model,
-        df_state,
-        tensor,
-        pad=True,
-        atten_lim_db=float(noise_attenuation_limit_db),
-    )
-    restored_48k = enhanced.detach().cpu().numpy().T.astype(np.float64, copy=False)
-    restored = _resample(restored_48k, model_sr, sr)
-    if len(restored) < original_frames:
-        restored = np.pad(restored, ((0, original_frames - len(restored)), (0, 0)))
-    restored = restored[:original_frames]
-    if not np.all(np.isfinite(restored)):
-        raise RuntimeError("O modelo neural produziu valores inválidos.")
+        model, df_state, model_name = init_df(
+            default_model="DeepFilterNet3",
+            post_filter=False,
+            log_file=None,
+            log_level="WARNING",
+        )
+        model_sr = 48_000
+        model_audio = _resample(declipped, sr, model_sr)
+        tensor = torch.from_numpy(model_audio.T.astype(np.float32, copy=False))
+        notify(0.62, "Reduzindo ruído do vocal com o modelo neural...")
+        enhanced = enhance(
+            model,
+            df_state,
+            tensor,
+            pad=True,
+            atten_lim_db=float(noise_attenuation_limit_db),
+        )
+        restored_48k = enhanced.detach().cpu().numpy().T.astype(np.float64, copy=False)
+        restored = _resample(restored_48k, model_sr, sr)
+        if len(restored) < original_frames:
+            restored = np.pad(restored, ((0, original_frames - len(restored)), (0, 0)))
+        restored = restored[:original_frames]
+        if not np.all(np.isfinite(restored)):
+            raise RuntimeError("O modelo neural produziu valores inválidos.")
 
-    neural_candidate_path = destination_path.with_name(destination_path.stem + "_deepfilternet_teste.wav")
-    neural_peak = float(np.max(np.abs(restored)))
-    neural_export = restored.copy()
-    if neural_peak > 10 ** (-0.1 / 20):
-        neural_export *= 10 ** (-0.1 / 20) / neural_peak
-    sf.write(neural_candidate_path, neural_export, sr, subtype="PCM_24")
+        neural_candidate_path = destination_path.with_name(destination_path.stem + "_deepfilternet_teste.wav")
+        neural_peak = float(np.max(np.abs(restored)))
+        neural_export = restored.copy()
+        if neural_peak > 10 ** (-0.1 / 20):
+            neural_export *= 10 ** (-0.1 / 20) / neural_peak
+        sf.write(neural_candidate_path, neural_export, sr, subtype="PCM_24")
+        neural_safety = candidate_metrics(audio, restored, sr, float(clip_info.get("clipped_frac", 0.0)))
+        neural_accepted = bool(neural_safety.get("accepted"))
+        neural_reason = str(neural_safety.get("reason"))
+        selected = restored if neural_accepted else declipped
+        device_noise = str(next(model.parameters()).device)
 
-    neural_safety = candidate_metrics(audio, restored, sr, float(clip_info.get("clipped_frac", 0.0)))
-    neural_accepted = bool(neural_safety.get("accepted"))
-    selected = restored if neural_accepted else declipped
     selected_engine = "BetterDeclipper + DeepFilterNet3" if neural_accepted else "BetterDeclipper"
     peak = float(np.max(np.abs(selected)))
     safety_gain = 1.0
@@ -155,7 +162,7 @@ def restore_vocal(
         "engine_selected": selected_engine,
         "engine_noise_tested": model_name,
         "device_clipping": clip_info.get("device", "desconhecido"),
-        "device_noise": str(next(model.parameters()).device),
+        "device_noise": device_noise,
         "clipped_fraction": float(clip_info.get("clipped_frac", 0.0)),
         "sample_rate": sr,
         "channels": audio.shape[1],
@@ -165,6 +172,6 @@ def restore_vocal(
         "safety_gain_db": float(20 * np.log10(safety_gain)) if safety_gain < 1 else 0.0,
         "identity_replaced": False,
         "neural_candidate_accepted": neural_accepted,
-        "neural_candidate_reason": neural_safety.get("reason"),
-        "neural_candidate_path": str(neural_candidate_path),
+        "neural_candidate_reason": neural_reason,
+        "neural_candidate_path": str(neural_candidate_path) if neural_candidate_path else None,
     }
